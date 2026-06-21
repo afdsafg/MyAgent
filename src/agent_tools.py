@@ -26,7 +26,7 @@ def silent_perception_step(
     # 检查是否与上次存档位置相同，避免重复快照
     if not hasattr(silent_perception_step, '_last_pos'):
         silent_perception_step._last_pos = None
-        silent_perception_step._step_counter = 0
+        silent_perception_step._step_counter = -1
     pos_changed = (
         silent_perception_step._last_pos is None
         or np.linalg.norm(np.array(pts) - np.array(silent_perception_step._last_pos)) > 0.5

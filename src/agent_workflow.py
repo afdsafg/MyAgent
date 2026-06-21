@@ -262,7 +262,7 @@ def run_episode(
         # 每 episode 重置步数计数器
         from src.agent_tools import silent_perception_step
         silent_perception_step._last_pos = None
-        silent_perception_step._step_counter = 0
+        silent_perception_step._step_counter = -1
 
         # Load concept graph config if not provided
         import yaml
