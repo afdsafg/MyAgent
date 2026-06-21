@@ -680,10 +680,25 @@ if __name__ == "__main__":
     # Load config
     import yaml
     from omegaconf import OmegaConf
+    from src.utils import get_pts_angle_aeqa
 
     with open(args.cfg, "r") as f:
         cfg = OmegaConf.create(yaml.safe_load(f))
     OmegaConf.resolve(cfg)
+
+    # Look up AEQA start position for this scene+question
+    start_pts = None
+    start_angle = 0.0
+    try:
+        questions_list = json.load(open(cfg.questions_list_path, "r"))
+        for qd in questions_list:
+            if qd["episode_history"] == args.scene and qd["question"] == args.question:
+                start_pts, start_angle = get_pts_angle_aeqa(
+                    qd["position"], qd["rotation"])
+                logging.info(f"AEQA start position: {start_pts}, angle: {start_angle}")
+                break
+    except Exception as e:
+        logging.warning(f"Could not find AEQA start position: {e}")
 
     # Load models (same as run_aeqa_evaluation.py)
     from ultralytics import SAM, YOLOWorld
@@ -706,6 +721,8 @@ if __name__ == "__main__":
         clip_preprocess=clip_preprocess,
         clip_tokenizer=clip_tokenizer,
         output_dir=args.output,
+        start_pts=start_pts,
+        start_angle=start_angle,
     )
 
     print(json.dumps(result, indent=2))
