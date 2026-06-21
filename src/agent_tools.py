@@ -116,11 +116,10 @@ def observe_panorama(
         clip_model, clip_preprocess, clip_tokenizer,
     )
 
-    # 保存全景 7 张视角到 MemoryStore（仅位置变化时）
-    if all_added_obj_ids:
-        room_id = tsdf_planner.get_room_id_at(
-            tsdf_planner.habitat2voxel(pts)[:2])
-        for ang_idx, view_rgb in enumerate(views):
+    # 保存全景 7 张视角到 MemoryStore（仅位置变化 + 有检测到物体）
+    room_id = tsdf_planner.get_room_id_at(
+        tsdf_planner.habitat2voxel(pts)[:2])
+    for ang_idx, view_rgb in enumerate(views):
             objs_in_view = [
                 scene.objects[oid]["class_name"]
                 for oid in scene.objects
