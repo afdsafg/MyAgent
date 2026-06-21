@@ -454,7 +454,7 @@ def run_episode(
                     except ValueError:
                         room_id = 0
                     pts, angle, _, obs_text = navigate_to_seed(
-                        tsdf_planner, pts, angle, room_id)
+                        scene, tsdf_planner, pts, angle, room_id)
 
                 elif tool == "navigate_to_frontier":
                     try:
@@ -462,7 +462,7 @@ def run_episode(
                     except ValueError:
                         frontier_id = 0
                     pts, angle, _, obs_text = navigate_to_frontier(
-                        tsdf_planner, pts, angle, frontier_id)
+                        scene, tsdf_planner, pts, angle, frontier_id)
 
                 elif tool == "query_memory":
                     obs_image = query_memory(memory_store, args)

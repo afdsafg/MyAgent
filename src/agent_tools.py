@@ -192,10 +192,10 @@ def navigate_to_object(
 
 
 def navigate_to_seed(
-    tsdf_planner, pts, angle, room_id, seed_idx=0,
+    scene, tsdf_planner, pts, angle, room_id, seed_idx=0,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str]:
-    """导航到指定房间的 seed 点。"""
-    from src.geom import get_nearest_true_point
+    """使用 pathfinder 导航到指定房间的 seed 区域。"""
+    from src.habitat import pos_normal_to_habitat, pos_habitat_to_normal
 
     room = None
     for r in tsdf_planner.room_regions:
@@ -206,39 +206,38 @@ def navigate_to_seed(
     if room is None:
         return pts, angle, False, f"Room {room_id} not found"
 
-    center = room.center.astype(np.float64)
-    if seed_idx > 0:
-        coords = np.argwhere(room.region)
-        if len(coords) > seed_idx:
-            idx = min(seed_idx, len(coords) - 1)
-            center = coords[idx].astype(np.float64)
+    # Get room center in voxel → normal → habitat coordinates
+    voxel_center = room.center.astype(np.float64)
+    center_normal = voxel_center * tsdf_planner._voxel_size + tsdf_planner._vol_origin[:2]
+    center_normal = np.append(center_normal, pts[2])
+    target_habitat = pos_normal_to_habitat(center_normal)
 
-    nav = get_nearest_true_point(
-        center.astype(int), tsdf_planner.unoccupied)
-    if nav is None:
+    # Find navigable point near the target
+    nav = scene.pathfinder.get_random_navigable_point_near(
+        circle_center=target_habitat, radius=2.0, max_tries=20)
+    if np.isnan(nav).any():
         return pts, angle, False, f"No navigable point near room {room_id} center"
 
-    direction = nav - tsdf_planner.habitat2voxel(pts)[:2]
-    direction_habitat = np.array([
-        direction[1] * tsdf_planner._voxel_size,
-        0,
-        -direction[0] * tsdf_planner._voxel_size,
-    ])
-    direction_norm = np.linalg.norm(direction_habitat)
+    # Step toward the target (max ~1m per step)
+    direction = nav - pts
+    direction[1] = 0  # keep same height
+    dist = np.linalg.norm(direction)
+    if dist < 0.1:
+        return pts, angle, True, f"Already at room {room_id}"
 
-    if direction_norm > 0:
-        new_angle = np.arctan2(
-            direction_habitat[0], -direction_habitat[2]) - np.pi / 2
-    else:
-        new_angle = angle
+    step_size = min(1.0, dist)
+    new_pts = pts + (direction / dist) * step_size
+    new_angle = np.arctan2(direction[0], -direction[2]) - np.pi / 2
 
-    return pts, new_angle, True, f"Facing room {room_id}"
+    return new_pts, new_angle, True, f"Moving toward room {room_id} ({dist:.1f}m away)"
 
 
 def navigate_to_frontier(
-    tsdf_planner, pts, angle, frontier_id,
+    scene, tsdf_planner, pts, angle, frontier_id,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str]:
-    """导航到指定 frontier。"""
+    """使用 pathfinder 导航到指定 frontier 区域。"""
+    from src.habitat import pos_normal_to_habitat
+
     frontier = None
     for ft in tsdf_planner.frontiers:
         if ft.frontier_id == frontier_id:
@@ -248,16 +247,30 @@ def navigate_to_frontier(
     if frontier is None:
         return pts, angle, False, f"Frontier {frontier_id} not found"
 
-    direction = np.array(frontier.position, dtype=float)
-    direction -= tsdf_planner.habitat2voxel(pts)[:2]
-    direction_norm_val = np.linalg.norm(direction)
+    # Convert frontier voxel position to habitat
+    voxel_pos = frontier.position.astype(np.float64)
+    pos_normal = voxel_pos * tsdf_planner._voxel_size + tsdf_planner._vol_origin[:2]
+    pos_normal = np.append(pos_normal, pts[2])
+    target_habitat = pos_normal_to_habitat(pos_normal)
 
-    if direction_norm_val > 0:
-        new_angle = np.arctan2(direction[1], direction[0]) - np.pi / 2
-    else:
-        new_angle = angle
+    # Find navigable point near the frontier
+    nav = scene.pathfinder.get_random_navigable_point_near(
+        circle_center=target_habitat, radius=2.0, max_tries=20)
+    if np.isnan(nav).any():
+        return pts, angle, False, f"No navigable point near frontier {frontier_id}"
 
-    return pts, new_angle, True, f"Facing frontier {frontier_id}"
+    # Step toward the target
+    direction = nav - pts
+    direction[1] = 0
+    dist = np.linalg.norm(direction)
+    if dist < 0.1:
+        return pts, angle, True, f"Already at frontier {frontier_id}"
+
+    step_size = min(1.0, dist)
+    new_pts = pts + (direction / dist) * step_size
+    new_angle = np.arctan2(direction[0], -direction[2]) - np.pi / 2
+
+    return new_pts, new_angle, True, f"Moving toward frontier {frontier_id} ({dist:.1f}m away)"
 
 
 def query_memory(
