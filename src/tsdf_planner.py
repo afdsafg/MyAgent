@@ -720,8 +720,12 @@ class TSDFPlanner(TSDFPlannerBase):
                     self.target_point - cur_point[:2]
                 )  # if the target is a frontier, then the agent should face the target point
             else:
+                # max_point may be a numpy array (target_type="image"/"object")
+                # or an object with .position attribute
+                mp = (self.max_point[:2] if isinstance(self.max_point, np.ndarray)
+                      else self.max_point.position)
                 direction = (
-                    self.max_point.position - cur_point[:2]
+                    mp - cur_point[:2]
                 )  # if the target is an object, then the agent should face the object
         else:  # the agent is still on the way to the target point
             direction = next_point - cur_point[:2]
