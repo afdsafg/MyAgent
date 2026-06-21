@@ -9,3 +9,8 @@ OPENAI_KEY = ""
 OPENAI_API_KEY = "sk-saR5vgZjuzOpDn0wAbZnttiNvgRuoWLIok112YEWjeq1mLZvl9kFUMd88z2FpQ5Q"
 OPENAI_BASE_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 MODEL_NAME = "mimo-v2.5"
+
+# GroundingDINO (server path per docs/plans/2026-06-21-hmge-implementation.md)
+GROUNDINGDINO_DIR = "/home/afdsafg/grouding dino/GroundingDINO"
+GROUNDINGDINO_CONFIG = "groundingdino/config/GroundingDINO_SwinT_OGC.py"
+GROUNDINGDINO_WEIGHTS = "weights/groundingdino_swint_ogc.pth"

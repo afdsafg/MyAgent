@@ -950,11 +950,14 @@ _gd_model = None
 _gd_transform = None
 
 
-def _load_gd_model(gd_dir="/root/ContextNav/GroundingDINO", device="cuda"):
+def _load_gd_model(gd_dir=None, device="cuda"):
     """Lazy-load GroundingDINO Swin-T model and transform."""
     global _gd_model, _gd_transform
     if _gd_model is not None:
         return _gd_model, _gd_transform
+
+    if gd_dir is None:
+        from src.const import GROUNDINGDINO_DIR as gd_dir
 
     import sys
     if gd_dir not in sys.path:
@@ -963,11 +966,11 @@ def _load_gd_model(gd_dir="/root/ContextNav/GroundingDINO", device="cuda"):
     import groundingdino.datasets.transforms as gd_transforms
     from groundingdino.util.inference import load_model as gd_load_model
 
-    config_path = os.path.join(
-        gd_dir, "groundingdino/config/GroundingDINO_SwinT_OGC.py")
-    weights_path = "/root/ContextNav/data/groundingdino_swint_ogc.pth"
+    from src.const import GROUNDINGDINO_CONFIG, GROUNDINGDINO_WEIGHTS
+    config_path = os.path.join(gd_dir, GROUNDINGDINO_CONFIG)
+    weights_path = os.path.join(gd_dir, GROUNDINGDINO_WEIGHTS)
 
-    logging.info(f"Loading GroundingDINO from {config_path}")
+    logging.info(f"Loading GroundingDINO from {config_path}, weights={weights_path}")
     _gd_model = gd_load_model(config_path, weights_path, device=device)
 
     _gd_transform = gd_transforms.Compose([
@@ -1017,7 +1020,7 @@ def _gd_detect(rgb, prompt, box_threshold=0.30, text_threshold=0.25):
 
 def grounded_navigate_to_object(
     scene, tsdf_planner, pts, angle, object_desc,
-    max_steps=20, gd_dir="/root/ContextNav/GroundingDINO",
+    max_steps=20, gd_dir=None,
     max_consecutive_failures=5,
 ):
     """GD 导航链：检测目标→计算导航点→移动。
@@ -1084,13 +1087,11 @@ def grounded_navigate_to_object(
             f"bbox={[round(x, 1) for x in bbox.tolist()]}"
         )
 
-        # 3. SAM mask
+        # 3. SAM mask — use the already-loaded scene.sam_predictor
         try:
-            from ultralytics import SAM as SAMModel
-            sam = SAMModel("sam_b.pt")
-            sam_out = sam.predict(rgb, bboxes=[bbox.tolist()], verbose=False)
+            sam_out = scene.sam_predictor.predict(
+                rgb, bboxes=[bbox.tolist()], verbose=False)
             mask = sam_out[0].masks.data.cpu().numpy()[0].astype(bool)
-            del sam
         except Exception as e:
             logging.warning(f"  GD step {step}: SAM failed: {e}")
             # Fallback: use the GD bbox as a rectangular mask
