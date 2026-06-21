@@ -199,14 +199,14 @@ class TSDFPlanner(TSDFPlannerBase):
         )
 
         if len(frontier_areas) == 0:
-            # this happens when there are stairs on the floor, and the planner cannot handle this situation
-            # just skip this question
-            logging.error(f"Error in update_frontier_map: frontier area size is 0")
+            # This is common early in exploration when the TSDF map is small
+            # and unexplored_neighbors counts don't fall in [min, max] range.
+            # Non-fatal: just means no frontiers detected yet.
+            logging.info(f"update_frontier_map: no frontiers yet (map still small)")
             self.frontiers = []
             return False
         if len(frontier_edge_areas) == 0:
-            # this happens rather rarely
-            logging.error(f"Error in update_frontier_map: frontier edge area size is 0")
+            logging.info(f"update_frontier_map: no frontier edges yet")
             self.frontiers = []
             return False
 
@@ -465,6 +465,7 @@ class TSDFPlanner(TSDFPlannerBase):
         pathfinder,
         random_position=False,
         observe_snapshot=True,
+        target_type=None,
     ) -> bool:
         if self.max_point is not None or self.target_point is not None:
             # if the next point is already set
@@ -566,6 +567,19 @@ class TSDFPlanner(TSDFPlannerBase):
 
                 self.target_point = target_point
                 return True
+        elif target_type == "image" or target_type == "object":
+            # Direct navigation to a habitat position (used by GD spiral nav).
+            # choice is a habitat 3D position (np.ndarray of shape (3,)).
+            target_point = self.habitat2voxel(choice)[:2]
+            self.max_point = target_point.copy()
+            self.target_point = get_nearest_true_point(
+                target_point, self.unoccupied)
+            if self.target_point is None:
+                logging.error(
+                    "Error in set_next_navigation_point: "
+                    "no unoccupied point found near target")
+                return False
+            return True
         elif type(choice) == Frontier:
             # find the direction into unexplored
             ft_direction = self.max_point.orientation
@@ -1462,9 +1476,19 @@ class TSDFPlanner(TSDFPlannerBase):
         Returns dict: {habitat_pos, voxel_xy, search_steps, spiral_dist} or None.
         """
         from src.habitat import pos_normal_to_habitat
+
+        # Early exit: if island is empty or None, no point searching
+        if self.island is None or self.island.sum() == 0:
+            logging.info("  spiral: island is empty, skipping search")
+            return None
+
         cy, cx = int(target_voxel_xy[0]), int(target_voxel_xy[1])
         h, w = self._tsdf_vol_cpu.shape[:2]
         island = self.island
+
+        # Clamp starting position to map bounds
+        cy = max(0, min(h - 1, cy))
+        cx = max(0, min(w - 1, cx))
 
         def _check_voxel(vy, vx):
             if vy < 0 or vy >= h or vx < 0 or vx >= w:
@@ -1532,6 +1556,9 @@ class TSDFPlanner(TSDFPlannerBase):
             if abs(vy - cy) > max_radius_voxels or abs(vx - cx) > max_radius_voxels:
                 break
 
+        logging.info(
+            f"  spiral: checked {total_checked} voxels, "
+            f"island_sum={int(island.sum())}, found nothing")
         return None
 
     def refresh_planner_grids(self, pts):

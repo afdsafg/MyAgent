@@ -1153,81 +1153,121 @@ def grounded_navigate_to_object(
         int(target_voxel[0]), int(target_voxel[1]))
 
     # ── Phase 2: Iterative spiral search + per-step navigation ──
+    # Per HM-GE stage-3 notes (迭代螺旋搜索多段导航.md):
+    #   1. 大范围螺旋搜索找到与 TSDF island 相交的最近可导航点
+    #   2. 导航到该点，每步融合地图（island 扩大）
+    #   3. 抵达后再次螺旋搜索，距离从 37→4 收敛
     cur_pts, cur_angle = pts.copy(), angle
     converged = False
+    arrived_any = False
+    map_h, map_w = tsdf_planner._tsdf_vol_cpu.shape[:2]
+    max_spiral_radius = max(map_h, map_w)  # search the entire map
+    from src.habitat import pose_habitat_to_tsdf
 
     for iteration in range(1, max_iterations + 1):
         logging.info(f"  GD iter {iteration}/{max_iterations}, pts={cur_pts.tolist()}")
 
-        # Refresh grids from current TSDF state
+        # 1. Refresh grids from current TSDF state
         tsdf_planner.refresh_planner_grids(cur_pts)
+        island_sum = int(tsdf_planner.island.sum()) if tsdf_planner.island is not None else 0
+        unocc_sum = int(tsdf_planner.unoccupied.sum()) if tsdf_planner.unoccupied is not None else 0
+        logging.info(f"  GD iter {iteration}: island={island_sum} unoccupied={unocc_sum}")
 
-        # Check if target is already navigable
+        # 2. Check if target is already navigable (on island)
         tv_y, tv_x = target_voxel_xy
-        h, w = tsdf_planner._tsdf_vol_cpu.shape[:2]
-        if (0 <= tv_y < h and 0 <= tv_x < w
+        if (0 <= tv_y < map_h and 0 <= tv_x < map_w
                 and tsdf_planner.island[tv_y, tv_x]):
             logging.info(f"  GD iter {iteration}: target on island, converging")
-            converged = True
-            break
+            # Snap to get exact habitat pos
+            normal_pos = tsdf_planner.voxel2normal(np.array([tv_y, tv_x]))
+            normal_3d = np.array([normal_pos[0], normal_pos[1], floor_height])
+            hab_pos = pos_normal_to_habitat(normal_3d)
+            snapped = scene.pathfinder.snap_point(hab_pos[:3])
+            if snapped is not None and not np.isnan(snapped).any():
+                cur_pts = snapped
+                converged = True
+                break
 
-        # Spiral search for nearest navigable point
+        # 3. 大范围螺旋搜索：从 target voxel 出发找最近的 island 可导航点
         spiral_result = tsdf_planner.spiral_search_navigable_point(
             pathfinder=scene.pathfinder,
             target_voxel_xy=target_voxel_xy,
             agent_habitat=cur_pts,
-            max_radius_voxels=80,
+            max_radius_voxels=max_spiral_radius,
             floor_height=floor_height,
         )
 
         if spiral_result is None:
-            logging.warning(f"  GD iter {iteration}: spiral search found nothing")
-            break
+            logging.warning(
+                f"  GD iter {iteration}: spiral search found nothing "
+                f"(island={island_sum} voxels)")
+            # Fallback: use pathfinder.snap_point on target habitat position
+            target_habitat = pos_normal_to_habitat(target_normal)
+            snapped = scene.pathfinder.snap_point(target_habitat[:3])
+            if snapped is not None and not np.isnan(snapped).any():
+                logging.info(
+                    f"  GD iter {iteration}: pathfinder fallback to {snapped.tolist()}")
+                # Navigate toward this point via set_next_navigation_point
+                spiral_result = {
+                    "habitat_pos": snapped,
+                    "voxel_xy": tuple(
+                        tsdf_planner.habitat2voxel(snapped)[:2].tolist()),
+                    "search_steps": 0,
+                    "spiral_dist": 0,
+                }
+            else:
+                # Last resort: step toward target direction
+                direction = target_habitat - cur_pts
+                direction[1] = 0
+                dir_norm = np.linalg.norm(direction)
+                if dir_norm < 1e-3:
+                    break
+                direction = direction / dir_norm
+                step_target = cur_pts + direction * min(2.0, dir_norm * 0.5)
+                snapped = scene.pathfinder.snap_point(step_target[:3])
+                if snapped is None or np.isnan(snapped).any():
+                    logging.warning(f"  GD iter {iteration}: all fallbacks failed")
+                    break
+                spiral_result = {
+                    "habitat_pos": snapped,
+                    "voxel_xy": tuple(
+                        tsdf_planner.habitat2voxel(snapped)[:2].tolist()),
+                    "search_steps": 0,
+                    "spiral_dist": 0,
+                }
 
+        spiral_dist = spiral_result["spiral_dist"]
+        nav_habitat = spiral_result["habitat_pos"]
         logging.info(
-            f"  GD iter {iteration}: spiral dist={spiral_result['spiral_dist']} "
-            f"voxel={spiral_result['voxel_xy']}"
-        )
+            f"  GD iter {iteration}: spiral dist={spiral_dist} "
+            f"voxel={spiral_result['voxel_xy']}")
 
-        if spiral_result["spiral_dist"] <= converge_dist_voxels:
+        # 4. 收敛判断
+        if spiral_dist <= converge_dist_voxels:
             logging.info(f"  GD iter {iteration}: converged (dist<={converge_dist_voxels})")
+            cur_pts = nav_habitat.copy()
             converged = True
             break
 
-        # Navigate to spiral point using set_next_navigation_point + agent_step
-        nav_habitat = spiral_result["habitat_pos"]
-        nav_voxel = tsdf_planner.habitat2voxel(nav_habitat)[:2]
-
-        # Set navigation target directly (bypass set_next_navigation_point
-        # which requires SnapShot/Frontier types)
+        # 5. 导航到螺旋点 — 使用 target_type="image" 直接设置 habitat 位置
         tsdf_planner.max_point = None
         tsdf_planner.target_point = None
-        from src.tsdf_planner import Frontier
-        # Create synthetic frontier at spiral result
-        cur_voxel = tsdf_planner.habitat2voxel(cur_pts)[:2]
-        direction = nav_voxel.astype(float) - cur_voxel.astype(float)
-        dir_norm = np.linalg.norm(direction)
-        if dir_norm > 1e-6:
-            direction = direction / dir_norm
-        else:
-            direction = np.array([0.0, 0.0])
-        synth_frontier = Frontier(
-            position=nav_voxel.astype(np.float64),
-            orientation=direction,
-            region=np.array([[nav_voxel[0], nav_voxel[1]]]),
-            frontier_id=-999,
-        )
         set_ok = tsdf_planner.set_next_navigation_point(
-            choice=synth_frontier, pts=cur_pts, objects=scene.objects,
+            choice=nav_habitat, pts=cur_pts, objects=scene.objects,
             cfg=cfg.planner, pathfinder=scene.pathfinder,
+            target_type="image", observe_snapshot=False,
         )
         if not set_ok:
-            logging.warning(f"  GD iter {iteration}: set_next_navigation_point failed")
+            logging.warning(
+                f"  GD iter {iteration}: set_next_navigation_point failed, "
+                f"teleporting to spiral point")
             tsdf_planner.max_point = None
             tsdf_planner.target_point = None
-            break
+            cur_pts = nav_habitat.copy()
+            continue
 
-        # Per-step navigation with map integration
+        # 6. 每步: agent_step → phase1 融合 → refresh_grids → update_frontier_map
+        arrived = False
         for nav_step in range(1, max_nav_steps_per_iter + 1):
             result = tsdf_planner.agent_step(
                 pts=cur_pts, angle=cur_angle, objects=scene.objects,
@@ -1242,7 +1282,6 @@ def grounded_navigate_to_object(
             cur_pts, cur_angle, _, _, _, target_arrived = result
 
             # Per-step map integration: render phase-1 views + integrate TSDF
-            from src.habitat import pose_habitat_to_tsdf
             view_angles = [
                 cur_angle - np.pi / 3, cur_angle, cur_angle + np.pi / 3
             ]
@@ -1259,21 +1298,35 @@ def grounded_navigate_to_object(
                     explored_depth=cfg.explored_depth,
                 )
 
+            # Refresh grids after integration so spiral search sees expanded map
+            tsdf_planner.refresh_planner_grids(cur_pts)
+
+            # Update frontier map (non-fatal)
+            try:
+                tsdf_planner.update_frontier_map(
+                    cur_pts, cfg.planner, scene, iteration * 100 + nav_step,
+                    save_frontier_image=False)
+            except Exception as e:
+                logging.warning(f"  GD iter {iteration} step {nav_step}: update_frontier_map failed: {e}")
+
             if target_arrived:
+                arrived = True
                 break
 
-        # Clear nav state for next iteration
+        # Clear nav state
         tsdf_planner.max_point = None
         tsdf_planner.target_point = None
 
-        # Update frontier map after navigation
-        try:
-            tsdf_planner.update_frontier_map(
-                cur_pts, cfg.planner, scene, iteration,
-                save_frontier_image=False)
-        except Exception as e:
-            logging.warning(f"  GD iter {iteration}: update_frontier_map failed: {e}")
+        if arrived:
+            arrived_any = True
+            if not converged:
+                logging.info(
+                    f"  GD iter {iteration}: arrived at spiral point but not converged, "
+                    f"re-spiraling with expanded map...")
+                continue
 
     if converged:
         return cur_pts, cur_angle, True, f"Reached target: {object_desc}", images
+    if arrived_any:
+        return cur_pts, cur_angle, True, f"Near target: {object_desc}", images
     return cur_pts, cur_angle, False, f"GD navigation incomplete for '{object_desc}'", images
