@@ -89,7 +89,12 @@ def call_vlm(
         return ""
 
     data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    message = data["choices"][0]["message"]
+    content = message.get("content")
+    if content is None:
+        # Reasoning models (e.g., mimo-v2.5) return text in reasoning_content
+        content = message.get("reasoning_content", "")
+    return content
 
 
 # ── System Prompt ───────────────────────────────────────────────────────
@@ -596,6 +601,8 @@ def _format_frontiers_info(tsdf_planner) -> str:
 
 def _parse_vlm_response(response: str) -> dict:
     """Parse VLM JSON response."""
+    if response is None:
+        response = ""
     try:
         # Try to find JSON block
         if "```" in response:
