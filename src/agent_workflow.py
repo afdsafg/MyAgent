@@ -8,6 +8,11 @@ import logging
 import os
 import sys
 import time
+
+# Ensure project root is on sys.path (needed when running from within src/)
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 import requests
 import numpy as np
 from typing import List, Optional, Tuple, Dict
