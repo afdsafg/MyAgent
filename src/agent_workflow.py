@@ -81,8 +81,30 @@ def call_vlm(
         "Content-Type": "application/json",
     }
 
-    resp = requests.post(
-        base_url, json=payload, headers=headers, timeout=180)
+    # Use xray proxy if available
+    proxies = None
+    proxy_http = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+    proxy_https = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+    if proxy_http or proxy_https:
+        proxies = {}
+        if proxy_http:
+            proxies["http"] = proxy_http
+        if proxy_https:
+            proxies["https"] = proxy_https
+
+    try:
+        resp = requests.post(
+            base_url, json=payload, headers=headers,
+            timeout=180, proxies=proxies)
+    except requests.exceptions.Timeout:
+        logger.error("VLM API timeout")
+        return ""
+    except requests.exceptions.ConnectionError as e:
+        logger.error(f"VLM API connection error: {e}")
+        return ""
+    except Exception as e:
+        logger.error(f"VLM API request failed: {e}")
+        return ""
 
     if resp.status_code != 200:
         logger.error(f"VLM API error: {resp.status_code} {resp.text[:500]}")
@@ -92,7 +114,6 @@ def call_vlm(
     message = data["choices"][0]["message"]
     content = message.get("content")
     if content is None:
-        # Reasoning models (e.g., mimo-v2.5) return text in reasoning_content
         content = message.get("reasoning_content", "")
     return content
 
