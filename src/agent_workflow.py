@@ -259,27 +259,28 @@ def run_episode(
             clip_tokenizer=clip_tokenizer,
         )
 
-        # Initialize TSDF planner
-        vol_bnds = np.array([
-            [cfg.tsdf.x_min, cfg.tsdf.y_min, cfg.tsdf.z_min],
-            [cfg.tsdf.x_max, cfg.tsdf.y_max, cfg.tsdf.z_max],
-        ])
+        # Determine starting position
+        # Try to get a navigable start point from the pathfinder
+        start_pts = scene.pathfinder.get_random_navigable_point()
+        if np.isnan(start_pts).any():
+            start_pts = np.array([0.0, 1.5, 0.0])
+        pts = start_pts.copy()
+
+        # Initialize TSDF planner — match original 3D-Mem approach
+        from src.geom import get_scene_bnds
+        vol_bnds, _ = get_scene_bnds(scene.pathfinder, floor_height=pts[1])
         tsdf_planner = TSDFPlanner(
             vol_bnds=vol_bnds,
-            voxel_size=cfg.tsdf.voxel_size,
-            floor_height=cfg.tsdf.floor_height,
-            floor_height_offset=cfg.tsdf.floor_height_offset,
-            pts_init=pos_normal_to_habitat(cfg.starting_point),
-            init_clearance=cfg.tsdf.init_clearance,
-            occupancy_height=cfg.tsdf.occupancy_height,
-            vision_height=cfg.tsdf.vision_height,
+            voxel_size=cfg.tsdf_grid_size,
+            floor_height=pts[1],
+            floor_height_offset=0,
+            pts_init=pts,
+            init_clearance=cfg.init_clearance * 2,
             save_visualization=False,
         )
 
         # Agent state
-        pts = np.array(cfg.starting_point, dtype=float)
-        pts = pos_normal_to_habitat(pts)
-        angle = 0.0  # facing what direction in habitat
+        angle = 0.0
 
         # Initial observation
         obs, cam_pose = scene.get_observation(pts, angle)

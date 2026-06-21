@@ -3,7 +3,7 @@ seed: 77
 exp_name: "exp_eval_aeqa"
 output_parent_dir: "results"
 scene_dataset_config_path: "data/hm3d_annotated_basis.scene_dataset_config.json"
-scene_data_path: "your_hm3d_path"
+scene_data_path: "/root/ContextNav/data/scene_datasets/hm3d"
 questions_list_path: 'data/aeqa_questions-41.json'
 
 concept_graph_config_path: "cfg/concept_graph_default.yaml"
