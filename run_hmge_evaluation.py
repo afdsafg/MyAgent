@@ -86,6 +86,10 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
         logging.info(f"Question: {question}")
         logging.info(f"Ground truth answer: {answer}")
 
+        # Get AEQA-provided starting position
+        pts, angle = get_pts_angle_aeqa(
+            question_data["position"], question_data["rotation"])
+
         # ── Run HM-GE Workflow ────────────────────────────────────────
         try:
             result = run_episode(
@@ -100,6 +104,8 @@ def main(cfg, start_ratio=0.0, end_ratio=1.0):
                 clip_tokenizer=clip_tokenizer,
                 output_dir=os.path.join(cfg.output_dir, "episodes"),
                 max_total_steps=cfg.get("hmge_max_steps", 50),
+                start_pts=pts,
+                start_angle=angle,
             )
         except Exception as e:
             logging.error(f"Episode {question_id} failed with error: {e}")

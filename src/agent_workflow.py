@@ -225,6 +225,8 @@ def run_episode(
     clip_tokenizer,
     output_dir: str = "/root/MyAgent/results/hmge",
     max_total_steps: int = 50,
+    start_pts: Optional[np.ndarray] = None,
+    start_angle: float = 0.0,
 ) -> Dict:
     """Run a single HM-GE workflow episode.
 
@@ -285,12 +287,16 @@ def run_episode(
             clip_tokenizer=clip_tokenizer,
         )
 
-        # Determine starting position
-        # Try to get a navigable start point from the pathfinder
-        start_pts = scene.pathfinder.get_random_navigable_point()
-        if np.isnan(start_pts).any():
-            start_pts = np.array([0.0, 1.5, 0.0])
-        pts = start_pts.copy()
+        # Determine starting position — prefer AEQA-provided position
+        if start_pts is not None and not np.isnan(start_pts).any():
+            pts = start_pts.copy()
+            angle = start_angle
+        else:
+            start_pts_random = scene.pathfinder.get_random_navigable_point()
+            if np.isnan(start_pts_random).any():
+                start_pts_random = np.array([0.0, 1.5, 0.0])
+            pts = start_pts_random.copy()
+            angle = 0.0
 
         # Initialize TSDF planner — match original 3D-Mem approach
         from src.geom import get_scene_bnds
