@@ -23,6 +23,7 @@ from src.habitat import (
     make_simple_cfg,
     get_quaternion,
     get_navigable_point_to,
+    pos_normal_to_habitat,
 )
 from src.geom import get_cam_intr, IoU
 from src.utils import rgba2rgb
