@@ -1100,7 +1100,6 @@ def grounded_navigate_to_object(
                 cam_K=cam_intr,
                 image_rgb=rgb,
                 trans_pose=cam_pose_tsdf,
-                camera_convention="z_forward",
                 min_points_threshold=5,
                 spatial_sim_type=cfg_cg.spatial_sim_type,
                 obj_pcd_max_points=cfg_cg.obj_pcd_max_points,
