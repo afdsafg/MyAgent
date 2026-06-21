@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 def call_vlm(
     messages: List[dict],
     image_b64: Optional[str] = None,
-    max_tokens: int = 1024,
+    max_tokens: int = 4096,
     temperature: float = 0.3,
     api_key: Optional[str] = None,
     base_url: Optional[str] = None,
