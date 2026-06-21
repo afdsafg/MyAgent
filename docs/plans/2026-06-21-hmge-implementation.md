@@ -2,7 +2,7 @@
 
 > **For Claude:** 使用此计划逐任务实现 HM-GE Agent Workflow。每个 Task 完成后 commit。
 
-**仓库:** https://github.com/afdsafg/MyAgent.git (本地和服务器均在 `3D-Mem/` 目录中)
+**仓库:** https://github.com/afdsafg/MyAgent.git (本地 `3D-Mem/`，服务器 `/root/MyAgent/`)
 
 **目标:** 在 3D-Mem 基础上构建 HM-GE Agent 工作流系统，部署到服务器运行和调试。
 
@@ -10,7 +10,7 @@
 
 **技术栈:** Python 3.9, Habitat-Sim, YOLO-World, SAM, CLIP, GroundingDINO, OpenAI API (mimo-v2.5)
 
-**服��器:** root@8.147.163.63:59961, `/root/3D-Mem/`, conda env `3dmem`, GPU RTX5880-Ada-16Q
+**服��器:** root@8.147.163.63:59961, `/root/MyAgent/`, conda env `3dmem`, GPU RTX5880-Ada-16Q
 
 ---
 
@@ -19,12 +19,12 @@
 | 项目 | 值 |
 |------|-----|
 | SSH | `sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961` |
-| 项目目录 | `/root/3D-Mem/` |
+| 项目目录 | `/root/MyAgent/` |
 | Conda 环境 | `3dmem` (`/root/miniconda3/envs/3dmem/`) |
-| LLM API | `https://opencode.ai/zen/go/v1`, key `sk-saR5vgZjuzOpDn0wAbZnttiNvgRuoWLIok112YEWjeq1mLZvl9kFUMd88z2FpQ5Q`, model `mimo-v2.5` |
+| LLM API | `https://opencode.ai/zen/go/v1/chat/completions`, key `sk-saR5vgZjuzOpDn0wAbZnttiNvgRuoWLIok112YEWjeq1mLZvl9kFUMd88z2FpQ5Q`, model `mimo-v2.5` |
 | HM3D 数据 | `/root/ContextNav/data/scene_datasets/hm3d` |
-| AEQA 问题 | `/root/3D-Mem/data/aeqa_questions-41.json` |
-| 模型权重 | `/root/3D-Mem/sam_l.pt`, `/root/3D-Mem/yolov8x-world.pt` |
+| AEQA 问题 | `/root/MyAgent/data/aeqa_questions-41.json` |
+| 模型权重 | `/root/MyAgent/sam_l.pt`, `/root/MyAgent/yolov8x-world.pt` |
 | GroundingDINO | `/home/afdsafg/grouding dino/GroundingDINO/` |
 
 ---
@@ -49,31 +49,26 @@ Task 11: 全量 AEQA 41 题评估
 
 ### Task 1: 服务器项目初始化
 
-**目的:** 将本地修改同步到服务器，确认服务器环境可用。
+**目的:** 确认服务器 MyAgent 仓库已克隆，环境可用，API 配置正确。
 
-**Step 1: 本地打包 3D-Mem 上传到服务器**
+服务器上 `/root/MyAgent/` 已从 `https://github.com/afdsafg/MyAgent.git` 克隆完成，
+模型权重已通过软链接指向 `/root/3D-Mem/sam_l.pt` 和 `/root/3D-Mem/yolov8x-world.pt`。
 
-```bash
-cd /home/afdsafg/下载/new
-tar czf 3dmem_sync.tar.gz 3D-Mem/
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 3dmem_sync.tar.gz root@8.147.163.63:/root/
-```
-
-**Step 2: 服务器端解压覆盖**
+**Step 1: 拉取最新代码到服务器**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root && tar xzf 3dmem_sync.tar.gz'
+sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && git pull origin main'
 ```
 
-**Step 3: 验证服务器环境**
+**Step 2: 验证服务器环境**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && python -c "import habitat_sim; print(\"habitat OK\"); import torch; print(f\"torch {torch.__version__}, cuda={torch.cuda.is_available()}\")"'
+sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && python -c "import habitat_sim; print(\"habitat OK\"); import torch; print(f\"torch {torch.__version__}, cuda={torch.cuda.is_available()}\")"'
 ```
 
-**Step 4: 更新 const.py 中的 API 配置**
+**Step 3: 更新 const.py 中的 API 配置**
 
-编辑 `/root/3D-Mem/src/const.py`，确保包含：
+编辑 `/root/MyAgent/src/const.py`，确保包含：
 
 ```python
 OPENAI_API_KEY = "sk-saR5vgZjuzOpDn0wAbZnttiNvgRuoWLIok112YEWjeq1mLZvl9kFUMd88z2FpQ5Q"
@@ -81,7 +76,17 @@ OPENAI_BASE_URL = "https://opencode.ai/zen/go/v1/chat/completions"
 MODEL_NAME = "mimo-v2.5"
 ```
 
-**Step 5: Commit**
+**Step 4: 验证 GroundingDINO 路径**
+
+服务器上 GroundingDINO 路径为 `/home/afdsafg/grouding dino/GroundingDINO/`，确认存在：
+
+```bash
+sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'ls /home/afdsafg/grouding\ dino/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py 2>/dev/null && echo "GD OK" || echo "GD NOT FOUND"'
+```
+
+**Step 5: Commit 所有本地变更后推送，在服务器上验证**
+
+后续每个 Task 完成后：本地 `git push` → 服务器 `git pull`
 
 ---
 
@@ -165,7 +170,7 @@ self.room_counter = 1
 **Step 8: 上传到服务器并测试导入**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 /home/afdsafg/下载/new/3D-Mem/src/tsdf_planner.py root@8.147.163.63:/root/3D-Mem/src/
+cd /home/afdsafg/下载/new/3D-Mem && git push origin main && sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && git pull origin main'
 sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && python -c "from src.tsdf_planner import TSDFPlanner, RoomRegion, Frontier; print(\"Import OK\")"'
 ```
 
@@ -232,7 +237,7 @@ def grounded_navigate_to_object(
 **Step 4: 上传并测试**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 /home/afdsafg/下载/new/3D-Mem/src/scene_aeqa.py root@8.147.163.63:/root/3D-Mem/src/
+cd /home/afdsafg/下载/new/3D-Mem && git push origin main && sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && git pull origin main'
 sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && python -c "from src.scene_aeqa import Scene; print(\"Scene import OK\")"'
 ```
 
@@ -315,7 +320,7 @@ def fig_to_base64(fig) -> str:
 **Step 2: 上传并测试**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 /home/afdsafg/下载/new/3D-Mem/src/agent_image_utils.py root@8.147.163.63:/root/3D-Mem/src/
+cd /home/afdsafg/下载/new/3D-Mem && git push origin main && sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && git pull origin main'
 sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && python -c "from src.agent_image_utils import make_mosaic; import numpy as np; img = make_mosaic([np.zeros((100,100,3),dtype=np.uint8)+i*50 for i in range(4)]); print(f\"Mosaic shape: {img.shape}\")"'
 ```
 
@@ -435,7 +440,7 @@ class MemoryStore:
 **Step 2: 上传并测试**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 /home/afdsafg/下载/new/3D-Mem/src/agent_memory.py root@8.147.163.63:/root/3D-Mem/src/
+cd /home/afdsafg/下载/new/3D-Mem && git push origin main && sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && git pull origin main'
 sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && python -c "from src.agent_memory import MemoryStore; m = MemoryStore(); print(f\"MemoryStore OK, dir={m.output_dir}\")"'
 ```
 
@@ -691,7 +696,7 @@ def call_vlm(messages: List[dict], image_b64: Optional[str] = None) -> str:
 **Step 3: 上传并测试
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 /home/afdsafg/下载/new/3D-Mem/src/agent_workflow.py root@8.147.163.63:/root/3D-Mem/src/
+cd /home/afdsafg/下载/new/3D-Mem && git push origin main && sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && git pull origin main'
 ```
 
 **Step 4: Commit**
@@ -720,7 +725,7 @@ sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 /home/afdsafg/下
 **Step 2: 上传并运行首次测试**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 /home/afdsafg/下载/new/3D-Mem/run_hmge_evaluation.py root@8.147.163.63:/root/3D-Mem/
+cd /home/afdsafg/下载/new/3D-Mem && git push origin main && sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && git pull origin main'
 ```
 
 **Step 3: Commit**
@@ -736,7 +741,7 @@ sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 /home/afdsafg/下
 **Step 1: 在服务器上启动测试**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && python src/agent_workflow.py --scene 00824-Dd4bFSTQ8gi --question "What is hanging from the oven handle?" 2>&1 | tee /root/3D-Mem/results/hmge_test_oven.log'
+sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && python src/agent_workflow.py --scene 00824-Dd4bFSTQ8gi --question "What is hanging from the oven handle?" 2>&1 | tee /root/MyAgent/results/hmge_test_oven.log'
 ```
 
 **Step 2: 检查输出**
@@ -755,7 +760,7 @@ sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961
 **Step 1: 运行评估**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && nohup python run_hmge_evaluation.py -cf cfg/eval_aeqa.yaml > /root/3D-Mem/results/hmge_eval.log 2>&1 &'
+sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/3D-Mem && source /root/miniconda3/etc/profile.d/conda.sh && conda activate 3dmem && nohup python run_hmge_evaluation.py -cf cfg/eval_aeqa.yaml > /root/MyAgent/results/hmge_eval.log 2>&1 &'
 ```
 
 可选分流运行：
@@ -767,42 +772,23 @@ python run_hmge_evaluation.py -cf cfg/eval_aeqa.yaml --start_ratio 0.5 --end_rat
 **Step 2: 查看结果**
 
 ```bash
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cat /root/3D-Mem/results/exp_eval_aeqa/results.json | python -m json.tool | head -50'
+sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cat /root/MyAgent/results/exp_eval_aeqa/results.json | python -m json.tool | head -50'
 ```
 
 **Step 3: Commit 结果**
 
 ---
 
-## 快速部署脚本
+## 部署方式
 
-完成所有 Task 后，可使用以下一键部署脚本：
+**本地 git push → 服务器 git pull。** 所有代码都在仓库内，无需 scp 打包上传。
 
+每个 Task 完成后的部署步骤：
 ```bash
-#!/bin/bash
-# deploy_hmge.sh — 打包本地代码并上传到服务器
+# 本地 commit + push
+cd /home/afdsafg/下载/new/3D-Mem
+git add -A && git commit -m "task N: ..." && git push origin main
 
-echo "=== 1. 打包本地代码 ==="
-cd /home/afdsafg/下载/new
-tar czf hmge_deploy.tar.gz \
-  3D-Mem/src/tsdf_planner.py \
-  3D-Mem/src/scene_aeqa.py \
-  3D-Mem/src/agent_workflow.py \
-  3D-Mem/src/agent_tools.py \
-  3D-Mem/src/agent_memory.py \
-  3D-Mem/src/agent_context.py \
-  3D-Mem/src/agent_image_utils.py \
-  3D-Mem/run_hmge_evaluation.py
-
-echo "=== 2. 上传到服务器 ==="
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' scp -P 59961 hmge_deploy.tar.gz root@8.147.163.63:/root/
-
-echo "=== 3. 解压覆盖 ==="
-sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 \
-  'cd /root && tar xzf hmge_deploy.tar.gz'
-
-echo "=== 4. 清理 ==="
-rm hmge_deploy.tar.gz
-
-echo "=== 部署完成 ==="
+# 服务器拉取
+sshpass -p '9a36555f-8d0f-403a-b9e9-a60b83b2ef93' ssh root@8.147.163.63 -p 59961 'cd /root/MyAgent && git pull origin main'
 ```
