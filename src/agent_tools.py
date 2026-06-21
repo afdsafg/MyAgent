@@ -271,18 +271,24 @@ def navigate_to_object(
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """GD 导航到指定物体。返回 (pts, angle, success, status, img_b64)。
 
-    GD 导航内部循环检测→移动，VLM 不参与每子步决策，只在完成后被唤醒。
-    step_budget 用于限制 GD 循环步数，避免超出总步数配额。
+    GD 导航内部：检测→迭代螺旋搜索导航。VLM 不参与每子步决策，只在完成后被唤醒。
+    step_budget 用于限制导航步数，避免超出总步数配额。
     """
     from src.scene_aeqa import grounded_navigate_to_object as gd_nav
     from src.agent_image_utils import numpy_to_base64
 
-    # 用剩余配额限制 GD 步数
+    # 用剩余配额限制导航步数
+    max_nav = 15
+    max_iter = 5
     if step_budget is not None:
-        max_steps = min(max_steps, max(1, step_budget))
+        max_nav = min(max_nav, max(1, step_budget))
+        max_iter = min(max_iter, max(1, step_budget // 3))
 
     new_pts, new_angle, success, status, _images = gd_nav(
-        scene, tsdf_planner, pts, angle, object_desc, max_steps=max_steps,
+        scene, tsdf_planner, pts, angle, object_desc,
+        max_consecutive_failures=5,
+        max_iterations=max_iter, converge_dist_voxels=5,
+        max_nav_steps_per_iter=max_nav,
     )
 
     # GD 导航完成后做一次静默感知并存档（plan：到达子目标后 3 视角观测）

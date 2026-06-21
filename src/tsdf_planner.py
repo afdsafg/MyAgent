@@ -1447,3 +1447,116 @@ class TSDFPlanner(TSDFPlannerBase):
         self.room_regions = []
         for frontier in self.frontiers:
             frontier.room_id = -1
+
+    # ── Spiral search for nearest navigable point ──────────────────────
+
+    def spiral_search_navigable_point(
+        self, pathfinder, target_voxel_xy, agent_habitat,
+        max_radius_voxels=80, floor_height=0.07,
+    ):
+        """Clockwise spiral search on the 2D voxel grid starting from target.
+
+        Returns the *nearest* navigable habitat point on the agent's reachable
+        island, or None if nothing found within max_radius_voxels.
+
+        Returns dict: {habitat_pos, voxel_xy, search_steps, spiral_dist} or None.
+        """
+        from src.habitat import pos_normal_to_habitat
+        cy, cx = int(target_voxel_xy[0]), int(target_voxel_xy[1])
+        h, w = self._tsdf_vol_cpu.shape[:2]
+        island = self.island
+
+        def _check_voxel(vy, vx):
+            if vy < 0 or vy >= h or vx < 0 or vx >= w:
+                return None
+            if not island[vy, vx]:
+                return None
+            normal_pos = self.voxel2normal(np.array([vy, vx]))
+            normal_3d = np.array([normal_pos[0], normal_pos[1], floor_height])
+            hab_pos = pos_normal_to_habitat(normal_3d)
+            snapped = pathfinder.snap_point(hab_pos[:3])
+            if snapped is None or np.isnan(snapped).any():
+                return None
+            if abs(snapped[1] - floor_height) > 0.3:
+                return None
+            snapped_voxel = self.habitat2voxel(snapped)[:2]
+            if not self.check_within_bnds(snapped_voxel):
+                return None
+            sv_y, sv_x = int(snapped_voxel[0]), int(snapped_voxel[1])
+            if sv_y < 0 or sv_y >= h or sv_x < 0 or sv_x >= w:
+                return None
+            if not island[sv_y, sv_x]:
+                return None
+            if not pathfinder.is_navigable(snapped):
+                return None
+            return {"habitat_pos": snapped, "voxel_xy": (sv_y, sv_x)}
+
+        DIRS = [(0, 1), (1, 0), (0, -1), (-1, 0)]
+        total_checked = 0
+        vy, vx = cy, cx
+
+        result = _check_voxel(vy, vx)
+        total_checked += 1
+        if result is not None:
+            result["search_steps"] = total_checked
+            result["spiral_dist"] = 0
+            return result
+
+        step_len = 1
+        steps_done = 0
+        dir_idx = 0
+        segs_at_len = 0
+
+        for _ in range(max_radius_voxels * max_radius_voxels * 4):
+            dy, dx = DIRS[dir_idx]
+            vy += dy
+            vx += dx
+            steps_done += 1
+
+            result = _check_voxel(vy, vx)
+            total_checked += 1
+            if result is not None:
+                dist = abs(vy - cy) + abs(vx - cx)
+                result["search_steps"] = total_checked
+                result["spiral_dist"] = dist
+                return result
+
+            if steps_done == step_len:
+                steps_done = 0
+                dir_idx = (dir_idx + 1) % 4
+                segs_at_len += 1
+                if segs_at_len == 2:
+                    segs_at_len = 0
+                    step_len += 1
+
+            if abs(vy - cy) > max_radius_voxels or abs(vx - cx) > max_radius_voxels:
+                break
+
+        return None
+
+    def refresh_planner_grids(self, pts):
+        """Re-derive island/unoccupied/unexplored/occupied from current TSDF.
+
+        Mirrors update_frontier_map's grid setup. Call after integrate()
+        to make spiral_search see the latest navigable area.
+        """
+        from scipy import ndimage
+        from src.habitat import pos_habitat_to_normal
+        pts_normal = pos_habitat_to_normal(pts)
+        island, unoccupied = self.get_island_around_pts(
+            pts_normal, height=self.occupancy_height)
+        self.unoccupied = unoccupied
+        self.island = island
+        self.unexplored = (
+            np.sum(self._explore_vol_cpu, axis=-1) == 0
+        ).astype(int)
+        for point in self.init_points:
+            self.unexplored[point[0], point[1]] = 0
+        self.occupied = np.logical_not(self.unoccupied).astype(int)
+        kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]])
+        self.unexplored_neighbors = ndimage.convolve(
+            self.unexplored, kernel, mode="constant", cval=0.0)
+        self.occupied_map_camera = np.logical_not(
+            self.get_island_around_pts(
+                pts_normal, height=self.vision_height)[0]
+        )
