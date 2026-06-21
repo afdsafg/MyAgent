@@ -214,9 +214,16 @@ def navigate_to_seed(
 
     # 构造一个临时 Frontier 用作导航目标
     from src.tsdf_planner import Frontier
+    cur_voxel = tsdf_planner.habitat2voxel(pts)[:2]
+    direction = room.center.astype(np.float64) - cur_voxel
+    direction_norm = np.linalg.norm(direction)
+    if direction_norm > 1e-6:
+        direction = direction / direction_norm
+    else:
+        direction = np.array([0.0, 0.0])
     temp_frontier = Frontier(
         position=room.center.astype(np.float64),
-        orientation=np.array([0.0, 0.0]),
+        orientation=direction,
         region=room.region,
         frontier_id=-room_id,
     )
