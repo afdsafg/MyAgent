@@ -26,11 +26,15 @@ def silent_perception_step(
     # 检查是否与上次存档位置相同，避免重复快照
     if not hasattr(silent_perception_step, '_last_pos'):
         silent_perception_step._last_pos = None
+        silent_perception_step._step_counter = 0
     pos_changed = (
         silent_perception_step._last_pos is None
         or np.linalg.norm(np.array(pts) - np.array(silent_perception_step._last_pos)) > 0.5
     )
+    if pos_changed:
+        silent_perception_step._step_counter += 1
     silent_perception_step._last_pos = pts.tolist() if hasattr(pts, 'tolist') else list(pts)
+    step_id = silent_perception_step._step_counter
 
     angles = [angle - np.pi / 3, angle, angle + np.pi / 3]
     all_added_obj_ids = []
@@ -82,7 +86,7 @@ def silent_perception_step(
                 ) < cfg.scene_graph.obj_include_dist + 0.5
             ]
             memory_store.add_snapshot(
-                snapshot_id=f"step{cnt_step}_view{i}",
+                snapshot_id=f"step{step_id}_view{i}",
                 image=view_rgb,
                 room_id=room_id,
                 objects_in_view=objs_in_view,
@@ -131,7 +135,7 @@ def observe_panorama(
                 ) < cfg.scene_graph.obj_include_dist + 0.5
             ]
             memory_store.add_snapshot(
-                snapshot_id=f"step{cnt_step}_pano_view{ang_idx}",
+                snapshot_id=f"step{silent_perception_step._step_counter}_pano_view{ang_idx}",
                 image=view_rgb,
                 room_id=room_id,
                 objects_in_view=objs_in_view,
@@ -195,44 +199,49 @@ def navigate_to_object(
 
 
 def navigate_to_seed(
-    scene, tsdf_planner, pts, angle, room_id, seed_idx=0,
+    scene, tsdf_planner, pts, angle, room_id, cfg,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str]:
-    """使用 pathfinder 导航到指定房间的 seed 区域。"""
-    from src.habitat import pos_normal_to_habitat, pos_habitat_to_normal
+    """使用原 3D-Mem 导航链走向房间中心（set_next_navigation_point + agent_step）。"""
+    from src.habitat import pos_habitat_to_normal
 
     room = None
     for r in tsdf_planner.room_regions:
         if r.room_id == room_id:
             room = r
             break
-
     if room is None:
         return pts, angle, False, f"Room {room_id} not found"
 
-    # Get room center in voxel → normal → habitat coordinates
-    voxel_center = room.center.astype(np.float64)
-    center_normal = voxel_center * tsdf_planner._voxel_size + tsdf_planner._vol_origin[:2]
-    center_normal = np.append(center_normal, pts[2])
-    target_habitat = pos_normal_to_habitat(center_normal)
+    # 构造一个临时 Frontier 用作导航目标
+    from src.tsdf_planner import Frontier
+    temp_frontier = Frontier(
+        position=room.center.astype(np.float64),
+        orientation=np.array([0.0, 0.0]),
+        region=room.region,
+        frontier_id=-room_id,
+    )
 
-    # Find navigable point near the target
-    nav = scene.pathfinder.get_random_navigable_point_near(
-        circle_center=target_habitat, radius=2.0, max_tries=20)
-    if np.isnan(nav).any():
-        return pts, angle, False, f"No navigable point near room {room_id} center"
+    # 使用原 3D-Mem 逻辑设置导航目标
+    success = tsdf_planner.set_next_navigation_point(
+        choice=temp_frontier, pts=pts, objects=scene.objects,
+        cfg=cfg.planner, pathfinder=scene.pathfinder,
+    )
+    if not success:
+        return pts, angle, False, f"Failed to set nav target for room {room_id}"
 
-    # Step toward the target (max ~1m per step)
-    direction = nav - pts
-    direction[1] = 0  # keep same height
-    dist = np.linalg.norm(direction)
-    if dist < 0.1:
-        return pts, angle, True, f"Already at room {room_id}"
+    # 执行一步 agent_step
+    result = tsdf_planner.agent_step(
+        pts=pts, angle=angle, objects=scene.objects,
+        snapshots=scene.snapshots, pathfinder=scene.pathfinder,
+        cfg=cfg.planner, save_visualization=False,
+    )
+    if result[0] is None:
+        tsdf_planner.max_point = None
+        tsdf_planner.target_point = None
+        return pts, angle, False, f"agent_step failed for room {room_id}"
 
-    step_size = min(1.0, dist)
-    new_pts = pts + (direction / dist) * step_size
-    new_angle = np.arctan2(direction[0], -direction[2]) - np.pi / 2
-
-    return new_pts, new_angle, True, f"Moving toward room {room_id} ({dist:.1f}m away)"
+    new_pts, new_angle, _, _, _, _ = result
+    return new_pts, new_angle, True, f"Stepping toward room {room_id}"
 
 
 def navigate_to_frontier(

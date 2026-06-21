@@ -259,6 +259,11 @@ def run_episode(
     scene = None
     tsdf_planner = None
     try:
+        # 每 episode 重置步数计数器
+        from src.agent_tools import silent_perception_step
+        silent_perception_step._last_pos = None
+        silent_perception_step._step_counter = 0
+
         # Load concept graph config if not provided
         import yaml
         from omegaconf import OmegaConf, DictConfig
@@ -413,7 +418,7 @@ def run_episode(
                     logger.info(f"Answer submitted in stage {stage_num}: {answer}")
                     result["answer"] = answer
                     result["success"] = True
-                    result["steps_taken"] = total_steps
+                    result["steps_taken"] = silent_perception_step._step_counter
                     result["stages_completed"] = stage_num
                     return result
 
@@ -525,7 +530,7 @@ def run_episode(
                     logger.info(f"Answer in fallback: {answer}")
                     result["answer"] = answer
                     result["success"] = True
-                    result["steps_taken"] = total_steps
+                    result["steps_taken"] = silent_perception_step._step_counter
                     result["stages_completed"] = 5
                     return result
 
