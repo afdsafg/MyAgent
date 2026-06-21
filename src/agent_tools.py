@@ -21,6 +21,15 @@ def silent_perception_step(
 
     Returns: (new_pts, new_angle) — 通常不变，只在 GD 导航步中变化。
     """
+    # 检查是否与上次存档位置相同，避免重复快照
+    if not hasattr(silent_perception_step, '_last_pos'):
+        silent_perception_step._last_pos = None
+    pos_changed = (
+        silent_perception_step._last_pos is None
+        or np.linalg.norm(np.array(pts) - np.array(silent_perception_step._last_pos)) > 0.5
+    )
+    silent_perception_step._last_pos = pts.tolist() if hasattr(pts, 'tolist') else list(pts)
+
     angles = [angle - np.pi / 3, angle, angle + np.pi / 3]
     all_added_obj_ids = []
     rgb_views = []
@@ -54,12 +63,13 @@ def silent_perception_step(
         scene.periodic_cleanup_objects(
             frame_idx=cnt_step * 3 + view_idx, pts=pts)
 
-    # Snapshot 存档 — 每步始终保存 3 视角快照
+    # Snapshot 存档 — 仅在位置变化时保存
     scene.update_snapshots(
         obj_ids=set(all_added_obj_ids), min_detection=cfg.min_detection)
 
-    room_id = tsdf_planner.get_room_id_at(
-        tsdf_planner.habitat2voxel(pts)[:2])
+    if pos_changed:
+        room_id = tsdf_planner.get_room_id_at(
+            tsdf_planner.habitat2voxel(pts)[:2])
     for i, view_rgb in enumerate(rgb_views):
         # 收集当前视图中所有 object（不仅仅是新增的）
         objs_in_view = [
@@ -106,27 +116,28 @@ def observe_panorama(
         clip_model, clip_preprocess, clip_tokenizer,
     )
 
-    # 保存全景 7 张视角到 MemoryStore
-    room_id = tsdf_planner.get_room_id_at(
-        tsdf_planner.habitat2voxel(pts)[:2])
-    for ang_idx, view_rgb in enumerate(views):
-        objs_in_view = [
-            scene.objects[oid]["class_name"]
-            for oid in scene.objects
-            if np.linalg.norm(
-                scene.objects[oid]["bbox"].center[[0, 2]] - pts[[0, 2]]
-            ) < cfg.scene_graph.obj_include_dist + 0.5
-        ]
-        memory_store.add_snapshot(
-            snapshot_id=f"step{cnt_step}_pano_view{ang_idx}",
-            image=view_rgb,
-            room_id=room_id,
-            objects_in_view=objs_in_view,
-            position_3d=pts.tolist(),
-            clip_model=clip_model,
-            clip_preprocess=clip_preprocess,
-            clip_tokenizer=clip_tokenizer,
-        )
+    # 保存全景 7 张视角到 MemoryStore（仅位置变化时）
+    if all_added_obj_ids:
+        room_id = tsdf_planner.get_room_id_at(
+            tsdf_planner.habitat2voxel(pts)[:2])
+        for ang_idx, view_rgb in enumerate(views):
+            objs_in_view = [
+                scene.objects[oid]["class_name"]
+                for oid in scene.objects
+                if np.linalg.norm(
+                    scene.objects[oid]["bbox"].center[[0, 2]] - pts[[0, 2]]
+                ) < cfg.scene_graph.obj_include_dist + 0.5
+            ]
+            memory_store.add_snapshot(
+                snapshot_id=f"step{cnt_step}_pano_view{ang_idx}",
+                image=view_rgb,
+                room_id=room_id,
+                objects_in_view=objs_in_view,
+                position_3d=pts.tolist(),
+                clip_model=clip_model,
+                clip_preprocess=clip_preprocess,
+                clip_tokenizer=clip_tokenizer,
+            )
 
     # 更新房间分割
     tsdf_planner.update_frontier_map(
