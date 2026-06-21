@@ -16,10 +16,12 @@ def silent_perception_step(
     scene, tsdf_planner, pts, angle, cnt_step, memory_store,
     cam_intr, cfg, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer,
+    skip_snapshots=False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """每 step 静默执行：3 视角观测 + 全管线更新 + Snapshot 存档。
 
     Returns: (new_pts, new_angle) — 通常不变，只在 GD 导航步中变化。
+    如果 skip_snapshots=True，只做 TSDF/场景图更新，不存档。
     """
     # 检查是否与上次存档位置相同，避免重复快照
     if not hasattr(silent_perception_step, '_last_pos'):
@@ -67,7 +69,7 @@ def silent_perception_step(
     scene.update_snapshots(
         obj_ids=set(all_added_obj_ids), min_detection=cfg.min_detection)
 
-    if pos_changed:
+    if pos_changed and not skip_snapshots:
         room_id = tsdf_planner.get_room_id_at(
             tsdf_planner.habitat2voxel(pts)[:2])
         for i, view_rgb in enumerate(rgb_views):
@@ -109,11 +111,12 @@ def observe_panorama(
         obs, _ = scene.get_observation(pts, ang)
         views.append(obs["color_sensor"][..., :3])
 
-    # 静默执行感知（3视角 + TSDF + 场景图更新）
+    # 静默执行感知（3视角 + TSDF + 场景图更新，不存档3视角图）
     silent_perception_step(
         scene, tsdf_planner, pts, angle, cnt_step, memory_store,
         cam_intr, cfg, detection_model, sam_predictor,
         clip_model, clip_preprocess, clip_tokenizer,
+        skip_snapshots=True,
     )
 
     # 保存全景 7 张视角到 MemoryStore（仅位置变化 + 有检测到物体）
