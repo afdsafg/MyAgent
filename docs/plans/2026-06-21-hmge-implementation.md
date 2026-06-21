@@ -2,13 +2,15 @@
 
 > **For Claude:** 使用此计划逐任务实现 HM-GE Agent Workflow。每个 Task 完成后 commit。
 
+**仓库:** https://github.com/afdsafg/MyAgent.git (本地和服务器均在 `3D-Mem/` 目录中)
+
 **目标:** 在 3D-Mem 基础上构建 HM-GE Agent 工作流系统，部署到服务器运行和调试。
 
 **架构:** 外层 Python 控制阶段切换，阶段内 VLM 自主决策。直接复用 3D-Mem 核心类（Scene、TSDFPlanner），从 MSGNav 选择性移植房间分割和 GD 导航代码。
 
 **技术栈:** Python 3.9, Habitat-Sim, YOLO-World, SAM, CLIP, GroundingDINO, OpenAI API (mimo-v2.5)
 
-**服务器:** root@8.147.163.63:59961, `/root/3D-Mem/`, conda env `3dmem`, GPU RTX5880-Ada-16Q
+**服��器:** root@8.147.163.63:59961, `/root/3D-Mem/`, conda env `3dmem`, GPU RTX5880-Ada-16Q
 
 ---
 

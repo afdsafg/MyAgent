@@ -1,9 +1,10 @@
-# Agent Workflow 设计方案
+# HM-GE Agent Workflow 设计方案
 
 > 在 3D-Mem 中实现一个面向 AEQA 场景问答的 Agent 导航工作流。
 > 复用 MSGNav 中的房间分割、GD 导航链、感知管线等代码，避免重复造轮子。
 >
 > 创建时间: 2026-06-21
+> 仓库: https://github.com/afdsafg/MyAgent.git
 
 ---
 
