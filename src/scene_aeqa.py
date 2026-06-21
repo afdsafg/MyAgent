@@ -1017,6 +1017,7 @@ def _gd_detect(rgb, prompt, box_threshold=0.30, text_threshold=0.25):
 def grounded_navigate_to_object(
     scene, tsdf_planner, pts, angle, object_desc,
     max_steps=20, gd_dir="/root/ContextNav/GroundingDINO",
+    max_consecutive_failures=5,
 ):
     """GD 导航链：检测目标→计算导航点→移动。
 
@@ -1054,9 +1055,15 @@ def grounded_navigate_to_object(
             return pts, angle, False, "SAM not available", images
 
     steps_taken = 0
+    consecutive_failures = 0
 
     for step in range(max_steps):
         steps_taken = step + 1
+
+        # Early exit if nothing is working
+        if consecutive_failures >= max_consecutive_failures:
+            logging.info(f"  GD: giving up after {consecutive_failures} consecutive failures")
+            return pts, angle, False, f"GD navigation failed after {consecutive_failures} consecutive failures", images
 
         # 1. Render current view
         obs, cam_pose = scene.get_observation(pts, angle)
@@ -1068,6 +1075,7 @@ def grounded_navigate_to_object(
         bbox, phrase, score, image_pil = _gd_detect(rgb, object_desc)
         if bbox is None:
             logging.info(f"  GD step {step}: no detection for '{object_desc}'")
+            consecutive_failures += 1
             continue
 
         logging.info(
@@ -1112,6 +1120,7 @@ def grounded_navigate_to_object(
             )
         except Exception as e:
             logging.warning(f"  GD step {step}: back-project failed: {e}")
+            consecutive_failures += 1
             continue
 
         if obj_list is None or len(obj_list) == 0 or obj_list[0] is None:
@@ -1146,6 +1155,7 @@ def grounded_navigate_to_object(
             f"normal={target_normal.tolist()} "
             f"habitat={target_habitat.tolist()}"
         )
+        consecutive_failures = 0  # reset on success
 
         # 5. Find navigable point near target
         nav_habitat = None
@@ -1164,6 +1174,7 @@ def grounded_navigate_to_object(
 
         if nav_habitat is None:
             logging.warning(f"  GD step {step}: no navigable point near target")
+            consecutive_failures += 1
             continue
 
         # 6. Navigate using pathfinder
