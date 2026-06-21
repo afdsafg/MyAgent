@@ -415,7 +415,7 @@ def run_episode(
                         sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
                     )
                     tsdf_planner.update_frontier_map(
-                        pts, cfg, scene, total_steps, save_frontier_image=False)
+                        pts, cfg.planner, scene, total_steps, save_frontier_image=False)
                     rooms_info = _format_rooms_info(tsdf_planner)
                     frontiers_info = _format_frontiers_info(tsdf_planner)
                     obs_text += f"\n{rooms_info}\n{frontiers_info}"

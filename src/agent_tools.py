@@ -104,7 +104,7 @@ def observe_panorama(
 
     # 更新房间分割
     tsdf_planner.update_frontier_map(
-        pts, cfg, scene, cnt_step, save_frontier_image=False)
+        pts, cfg.planner, scene, cnt_step, save_frontier_image=False)
 
     mosaic = make_mosaic(views, target_h=200)
     mosaic_b64 = numpy_to_base64(mosaic)
