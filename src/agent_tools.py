@@ -245,44 +245,40 @@ def navigate_to_seed(
 
 
 def navigate_to_frontier(
-    scene, tsdf_planner, pts, angle, frontier_id,
+    scene, tsdf_planner, pts, angle, frontier_id, cfg,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str]:
-    """使用 pathfinder 导航到指定 frontier 区域。"""
-    from src.habitat import pos_normal_to_habitat
+    """使用原 3D-Mem 导航链走向 frontier（set_next_navigation_point + agent_step）。"""
+    from src.habitat import pos_habitat_to_normal
 
     frontier = None
     for ft in tsdf_planner.frontiers:
         if ft.frontier_id == frontier_id:
             frontier = ft
             break
-
     if frontier is None:
         return pts, angle, False, f"Frontier {frontier_id} not found"
 
-    # Convert frontier voxel position to habitat
-    voxel_pos = frontier.position.astype(np.float64)
-    pos_normal = voxel_pos * tsdf_planner._voxel_size + tsdf_planner._vol_origin[:2]
-    pos_normal = np.append(pos_normal, pts[2])
-    target_habitat = pos_normal_to_habitat(pos_normal)
+    # 使用原 3D-Mem 逻辑设置导航目标
+    success = tsdf_planner.set_next_navigation_point(
+        choice=frontier, pts=pts, objects=scene.objects,
+        cfg=cfg.planner, pathfinder=scene.pathfinder,
+    )
+    if not success:
+        return pts, angle, False, f"Failed to set nav target for frontier {frontier_id}"
 
-    # Find navigable point near the frontier
-    nav = scene.pathfinder.get_random_navigable_point_near(
-        circle_center=target_habitat, radius=2.0, max_tries=20)
-    if np.isnan(nav).any():
-        return pts, angle, False, f"No navigable point near frontier {frontier_id}"
+    # 执行一步 agent_step
+    result = tsdf_planner.agent_step(
+        pts=pts, angle=angle, objects=scene.objects,
+        snapshots=scene.snapshots, pathfinder=scene.pathfinder,
+        cfg=cfg.planner, save_visualization=False,
+    )
+    if result[0] is None:
+        tsdf_planner.max_point = None
+        tsdf_planner.target_point = None
+        return pts, angle, False, f"agent_step failed for frontier {frontier_id}"
 
-    # Step toward the target
-    direction = nav - pts
-    direction[1] = 0
-    dist = np.linalg.norm(direction)
-    if dist < 0.1:
-        return pts, angle, True, f"Already at frontier {frontier_id}"
-
-    step_size = min(1.0, dist)
-    new_pts = pts + (direction / dist) * step_size
-    new_angle = np.arctan2(direction[0], -direction[2]) - np.pi / 2
-
-    return new_pts, new_angle, True, f"Moving toward frontier {frontier_id} ({dist:.1f}m away)"
+    new_pts, new_angle, _, _, _, _ = result
+    return new_pts, new_angle, True, f"Stepping toward frontier {frontier_id}"
 
 
 def query_memory(
