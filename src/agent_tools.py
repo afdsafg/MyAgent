@@ -99,12 +99,34 @@ def observe_panorama(
         obs, _ = scene.get_observation(pts, ang)
         views.append(obs["color_sensor"][..., :3])
 
-    # 静默执行感知
+    # 静默执行感知（3视角 + TSDF + 场景图更新）
     silent_perception_step(
         scene, tsdf_planner, pts, angle, cnt_step, memory_store,
         cam_intr, cfg, detection_model, sam_predictor,
         clip_model, clip_preprocess, clip_tokenizer,
     )
+
+    # 保存全景 7 张视角到 MemoryStore
+    room_id = tsdf_planner.get_room_id_at(
+        tsdf_planner.habitat2voxel(pts)[:2])
+    for ang_idx, view_rgb in enumerate(views):
+        objs_in_view = [
+            scene.objects[oid]["class_name"]
+            for oid in scene.objects
+            if np.linalg.norm(
+                scene.objects[oid]["bbox"].center[[0, 2]] - pts[[0, 2]]
+            ) < cfg.scene_graph.obj_include_dist + 0.5
+        ]
+        memory_store.add_snapshot(
+            snapshot_id=f"step{cnt_step}_pano_view{ang_idx}",
+            image=view_rgb,
+            room_id=room_id,
+            objects_in_view=objs_in_view,
+            position_3d=pts.tolist(),
+            clip_model=clip_model,
+            clip_preprocess=clip_preprocess,
+            clip_tokenizer=clip_tokenizer,
+        )
 
     # 更新房间分割
     tsdf_planner.update_frontier_map(
