@@ -1,5 +1,8 @@
 import os.path
+import logging
+from collections import deque
 
+import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 from skimage import measure
@@ -22,6 +25,19 @@ from src.utils import resize_image
 
 
 @dataclass
+class RoomRegion:
+    """Geometric room region segmented from the current TSDF occupancy map."""
+    room_id: int
+    center: np.ndarray
+    region: np.ndarray
+    area: int
+    room_state: str = "unknown"
+    observed_ratio: float = 0.0
+    hypothesis_node_id: Optional[str] = None
+    frontier_ids: List[int] = field(default_factory=list)
+
+
+@dataclass
 class Frontier:
     """Frontier class for frontier-based exploration."""
 
@@ -40,6 +56,8 @@ class Frontier:
     feature: torch.Tensor = (
         None  # the image feature of the snapshot, not used when generating data
     )
+    room_id: int = -1
+    room_state: str = ""
 
     def __eq__(self, other):
         if not isinstance(other, Frontier):
@@ -65,6 +83,7 @@ class SnapShot:
     )  # object id to confidence
     cluster: List[int] = field(default_factory=list)
     position: np.ndarray = None
+    room_id: int = -1
 
     def __eq__(self, other):
         raise NotImplementedError("Cannot compare SnapShot objects.")
@@ -118,6 +137,11 @@ class TSDFPlanner(TSDFPlannerBase):
         # about frontier allocation
         self.frontier_map = np.zeros(self._vol_dim[:2], dtype=int)
         self.frontier_counter = 1
+
+        # Room segmentation state
+        self.room_map = np.zeros(self._vol_dim[:2], dtype=int)
+        self.room_regions: List[RoomRegion] = []
+        self.room_counter = 1
 
         # about storing occupancy information on each step
         self.unexplored = None
@@ -425,6 +449,10 @@ class TSDFPlanner(TSDFPlannerBase):
                 )
                 frontier.image = f"{cnt_step}_{i}.png"
                 frontier.feature = processed_rgb
+
+        # Update room segmentation
+        if pts is not None:
+            room_success = self.update_room_map(cfg=cfg, pts=pts)
 
         return True
 
@@ -1005,3 +1033,417 @@ class TSDFPlanner(TSDFPlannerBase):
 
     def free_frontier(self, frontier: Frontier):
         self.frontier_map[self.frontier_map == frontier.frontier_id] = 0
+
+    # ── Room Segmentation Methods ───────────────────────────────────────
+
+    @staticmethod
+    def _cfg_get(cfg, key, default):
+        if cfg is None:
+            return default
+        try:
+            return getattr(cfg, key)
+        except Exception:
+            try:
+                return cfg[key]
+            except Exception:
+                return default
+
+    def get_room_id_at(self, point: np.ndarray) -> int:
+        if self.room_map is None or point is None:
+            return -1
+        if len(self.room_regions) == 0 or not np.any(self.room_map > 0):
+            return -1
+        point = np.asarray(point).astype(int)
+        if point.shape[0] > 2:
+            point = point[:2]
+        if (point[0] < 0 or point[0] >= self.room_map.shape[0]
+            or point[1] < 0 or point[1] >= self.room_map.shape[1]):
+            return -1
+        room_id = int(self.room_map[point[0], point[1]])
+        if room_id != 0:
+            return room_id
+        nearest = get_nearest_true_point(point, self.room_map > 0)
+        if nearest is None:
+            return -1
+        return int(self.room_map[nearest[0], nearest[1]])
+
+    def _find_geometric_room_seed_masks(
+        self, room_area, min_room_area, seed_radius, seed_min_distance,
+    ) -> List[np.ndarray]:
+        seeds = []
+        labels = measure.label(room_area, connectivity=1)
+        kernel_size = max(3, int(seed_min_distance) * 2 + 1)
+        kernel = np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        for label in np.unique(labels):
+            if label == 0:
+                continue
+            component = labels == label
+            if np.count_nonzero(component) < min_room_area:
+                continue
+            dist = cv2.distanceTransform(
+                component.astype(np.uint8), cv2.DIST_L2, maskSize=5)
+            local_max = (dist == cv2.dilate(dist, kernel)) & component & (dist > 0)
+            peak_labels = measure.label(local_max, connectivity=1)
+            peak_centers = []
+            for peak_label in np.unique(peak_labels):
+                if peak_label == 0:
+                    continue
+                peak = peak_labels == peak_label
+                peak_coords = np.argwhere(peak)
+                if len(peak_coords) == 0:
+                    continue
+                peak_values = dist[peak]
+                best = peak_coords[int(np.argmax(peak_values))]
+                peak_centers.append(best)
+            if len(peak_centers) == 0:
+                coords = np.argwhere(component)
+                center = get_nearest_true_point(
+                    np.round(coords.mean(axis=0)).astype(int), component)
+                if center is None:
+                    center = coords[0]
+                peak_centers = [center]
+            for center in peak_centers:
+                seed = self._disk_seed_mask(
+                    center=np.asarray(center, dtype=int),
+                    room_area=room_area,
+                    radius=max(1, seed_radius),
+                )
+                if np.any(seed):
+                    seeds.append(seed)
+        return seeds
+
+    @staticmethod
+    def _disk_seed_mask(center: np.ndarray, room_area: np.ndarray, radius: int) -> np.ndarray:
+        seed = np.zeros_like(room_area, dtype=bool)
+        y_min = max(0, center[0] - radius)
+        y_max = min(room_area.shape[0], center[0] + radius + 1)
+        x_min = max(0, center[1] - radius)
+        x_max = min(room_area.shape[1], center[1] + radius + 1)
+        yy, xx = np.ogrid[y_min:y_max, x_min:x_max]
+        disk = (yy - center[0]) ** 2 + (xx - center[1]) ** 2 <= radius ** 2
+        seed[y_min:y_max, x_min:x_max] = disk & room_area[y_min:y_max, x_min:x_max]
+        return seed
+
+    @staticmethod
+    def _grow_regions_from_seeds(room_area: np.ndarray, seeds: List[np.ndarray]) -> np.ndarray:
+        labels = np.zeros(room_area.shape, dtype=np.int32)
+        queue = deque()
+        for label, seed in enumerate(seeds, start=1):
+            for point in np.argwhere(seed & room_area):
+                row, col = int(point[0]), int(point[1])
+                if labels[row, col] == 0:
+                    labels[row, col] = label
+                    queue.append((row, col, label))
+        while queue:
+            row, col, label = queue.popleft()
+            for next_row, next_col in ((row - 1, col), (row + 1, col), (row, col - 1), (row, col + 1)):
+                if (next_row < 0 or next_row >= room_area.shape[0]
+                    or next_col < 0 or next_col >= room_area.shape[1]):
+                    continue
+                if not room_area[next_row, next_col] or labels[next_row, next_col] != 0:
+                    continue
+                labels[next_row, next_col] = label
+                queue.append((next_row, next_col, label))
+        return labels
+
+    @staticmethod
+    def _make_watershed_seeds_from_grown_regions(grown_regions: List[np.ndarray], seed_area_min: int) -> List[np.ndarray]:
+        seeds = []
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        for region in grown_regions:
+            eroded = cv2.erode(region.astype(np.uint8), kernel, iterations=1) > 0
+            if np.count_nonzero(eroded) < seed_area_min:
+                seeds.append(region)
+            else:
+                seeds.append(eroded)
+        return seeds
+
+    @staticmethod
+    def _fill_watershed_boundary_gaps(
+        refined_regions: List[np.ndarray],
+        grown_labels: np.ndarray,
+        room_area: np.ndarray,
+        min_room_area: int,
+    ) -> List[np.ndarray]:
+        labels = np.zeros(room_area.shape, dtype=np.int32)
+        for label, region in enumerate(refined_regions, start=1):
+            labels[region] = label
+        missing = room_area & (labels == 0)
+        if np.any(missing):
+            labels[missing] = grown_labels[missing]
+        return [labels == label for label in range(1, len(refined_regions) + 1)
+                if np.count_nonzero(labels == label) >= min_room_area]
+
+    def _watershed_room_regions(self, room_area, seeds, min_room_area):
+        markers = np.zeros(room_area.shape, dtype=np.int32)
+        for idx, seed in enumerate(seeds, start=1):
+            markers[seed] = idx
+        background_id = len(seeds) + 1
+        markers[np.logical_not(room_area)] = background_id
+        watershed_img = np.repeat(
+            (room_area.astype(np.uint8) * 255)[:, :, None], 3, axis=2)
+        cv2.watershed(watershed_img, markers)
+        regions = []
+        for label in range(1, background_id):
+            region = (markers == label) & room_area
+            if np.count_nonzero(region) >= min_room_area:
+                regions.append(region)
+        return regions
+
+    def _filter_room_regions_by_observed_adjacency(
+        self, regions, observed_threshold=0.30, max_unobserved_hops=1, adjacency_dilation=1,
+    ):
+        if max_unobserved_hops < 0 or self.unexplored is None:
+            return regions
+        if len(regions) == 0:
+            return []
+        explored = self.unexplored == 0
+        for point in getattr(self, "init_points", []):
+            if (0 <= point[0] < explored.shape[0]
+                and 0 <= point[1] < explored.shape[1]):
+                explored[point[0], point[1]] = True
+        observed_indices = {idx for idx, region in enumerate(regions)
+                            if np.any(region) and float(np.mean(explored[region])) >= observed_threshold}
+        if len(observed_indices) == 0:
+            return []
+        allowed_indices = set(observed_indices)
+        frontier_indices = set(observed_indices)
+        for _ in range(max_unobserved_hops):
+            next_indices = set()
+            for idx, region in enumerate(regions):
+                if idx in allowed_indices:
+                    continue
+                if any(self._room_regions_are_adjacent(region, regions[fi], dilation_iterations=adjacency_dilation)
+                       for fi in frontier_indices):
+                    next_indices.add(idx)
+            if len(next_indices) == 0:
+                break
+            allowed_indices.update(next_indices)
+            frontier_indices = next_indices
+        return [region for idx, region in enumerate(regions) if idx in allowed_indices]
+
+    @staticmethod
+    def _room_regions_are_adjacent(region_a, region_b, dilation_iterations=1) -> bool:
+        if not np.any(region_a) or not np.any(region_b):
+            return False
+        if np.any(region_a & region_b):
+            return True
+        iterations = max(1, int(dilation_iterations))
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        dilated = cv2.dilate(region_a.astype(np.uint8), kernel, iterations=iterations) > 0
+        return bool(np.any(dilated & region_b))
+
+    def _commit_room_regions(self, regions, stable_iou_threshold, observed_threshold=0.30):
+        previous_regions = self.room_regions
+        used_previous_ids = set()
+        room_map = np.zeros(self._vol_dim[:2], dtype=int)
+        room_regions = []
+        regions = sorted(regions, key=lambda r: np.count_nonzero(r), reverse=True)
+        for region in regions:
+            room_id = self._match_previous_room_id(
+                region, previous_regions, used_previous_ids, stable_iou_threshold)
+            if room_id is None:
+                room_id = self.room_counter
+                self.room_counter += 1
+            used_previous_ids.add(room_id)
+            coords = np.argwhere(region)
+            center = coords.mean(axis=0)
+            center = get_nearest_true_point(np.round(center).astype(int), region)
+            if center is None:
+                center = coords[0]
+            room_map[region] = room_id
+            room_regions.append(RoomRegion(
+                room_id=room_id, center=np.asarray(center, dtype=int),
+                region=region, area=int(np.count_nonzero(region)),
+            ))
+        self.room_map = room_map
+        self.room_regions = sorted(room_regions, key=lambda r: r.room_id)
+        self._refresh_room_observation_states(observed_threshold=observed_threshold)
+
+    @staticmethod
+    def _match_previous_room_id(region, previous_regions, used_previous_ids, stable_iou_threshold):
+        best_iou = 0.0
+        best_room_id = None
+        for previous in previous_regions:
+            if previous.room_id in used_previous_ids:
+                continue
+            intersection = np.count_nonzero(region & previous.region)
+            union = np.count_nonzero(region | previous.region)
+            iou = intersection / union if union > 0 else 0.0
+            if iou > best_iou:
+                best_iou = iou
+                best_room_id = previous.room_id
+        if best_iou >= stable_iou_threshold:
+            return best_room_id
+        return None
+
+    def _refresh_room_observation_states(self, observed_threshold=0.30):
+        if self.unexplored is None:
+            return
+        explored = self.unexplored == 0
+        for room in self.room_regions:
+            if not np.any(room.region):
+                room.observed_ratio = 0.0
+                room.room_state = "unknown"
+                continue
+            room.observed_ratio = float(np.mean(explored[room.region]))
+            room.room_state = (
+                "observed" if room.observed_ratio >= observed_threshold else "hypothesis"
+            )
+
+    def _assign_frontiers_to_rooms(self):
+        for room in self.room_regions:
+            room.frontier_ids = []
+        room_by_id = {room.room_id: room for room in self.room_regions}
+        for frontier in self.frontiers:
+            frontier.room_id = self.get_room_id_at(frontier.position)
+            if frontier.room_id in room_by_id:
+                room_by_id[frontier.room_id].frontier_ids.append(frontier.frontier_id)
+
+    def _get_room_segmentation_envelope(self, area_source, unoccupied_high):
+        navigable = unoccupied_high.astype(bool)
+        explored = self.unexplored == 0
+        for point in getattr(self, "init_points", []):
+            if (0 <= point[0] < explored.shape[0]
+                and 0 <= point[1] < explored.shape[1]):
+                explored[point[0], point[1]] = True
+        if area_source in {"navigable", "all", "explored_and_unexplored"}:
+            return navigable
+        if area_source == "unexplored":
+            return navigable & np.logical_not(explored)
+        if area_source != "explored":
+            logging.warning(
+                "Unknown room_segmentation.area_source=%s; falling back to explored.",
+                area_source)
+        return navigable & explored
+
+    @staticmethod
+    def _connected_room_regions(room_area, min_room_area):
+        labels = measure.label(room_area, connectivity=1)
+        return [labels == label for label in np.unique(labels)
+                if label != 0 and np.count_nonzero(labels == label) >= min_room_area]
+
+    def _find_room_seed_masks(self, room_area, min_area, max_area, max_iterations):
+        boundary = np.logical_not(room_area).astype(np.uint8) * 255
+        kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+        seeds = []
+        for _ in range(max_iterations):
+            boundary = cv2.dilate(boundary, kernel, iterations=1)
+            remaining_free = cv2.bitwise_not(boundary)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                remaining_free, connectivity=8)
+            for label in range(1, num_labels):
+                area = stats[label, cv2.CC_STAT_AREA]
+                if min_area <= area <= max_area:
+                    mask = labels == label
+                    if np.any(mask):
+                        seeds.append(mask)
+                        boundary[mask] = 255
+            if np.all(boundary == 255):
+                break
+        return seeds
+
+    def _region_growing_watershed_room_regions(
+        self, room_area, min_room_area, seed_area_min, seed_radius, seed_min_distance,
+    ):
+        seeds = self._find_geometric_room_seed_masks(
+            room_area=room_area, min_room_area=min_room_area,
+            seed_radius=seed_radius, seed_min_distance=seed_min_distance,
+        )
+        if len(seeds) == 0:
+            return self._connected_room_regions(room_area, min_room_area)
+        grown_labels = self._grow_regions_from_seeds(room_area, seeds)
+        grown_regions = [grown_labels == label
+                         for label in range(1, len(seeds) + 1)
+                         if np.count_nonzero(grown_labels == label) >= min_room_area]
+        if len(grown_regions) == 0:
+            return self._connected_room_regions(room_area, min_room_area)
+        watershed_seeds = self._make_watershed_seeds_from_grown_regions(
+            grown_regions=grown_regions, seed_area_min=seed_area_min,
+        )
+        refined_regions = self._watershed_room_regions(
+            room_area, watershed_seeds, min_room_area)
+        if len(refined_regions) == 0:
+            return grown_regions
+        return self._fill_watershed_boundary_gaps(
+            refined_regions=refined_regions, grown_labels=grown_labels,
+            room_area=room_area, min_room_area=min_room_area,
+        )
+
+    def update_room_map(self, cfg=None, pts=None) -> bool:
+        if self.unoccupied is None or self.island is None or pts is None:
+            return False
+
+        min_room_area = self._cfg_get(cfg, "min_room_area", 16)
+        seed_area_min = self._cfg_get(cfg, "seed_area_min", 6)
+        seed_area_max = self._cfg_get(cfg, "seed_area_max", 400)
+        max_dilation_iter = self._cfg_get(cfg, "max_dilation_iter", 80)
+        stable_iou_threshold = self._cfg_get(cfg, "stable_iou_threshold", 0.2)
+        close_iterations = self._cfg_get(cfg, "close_iterations", 1)
+        room_height = self._cfg_get(cfg, "room_height", 1.8)
+        observed_threshold = float(self._cfg_get(cfg, "observed_ratio_threshold", 0.30))
+        max_unobserved_hops = int(self._cfg_get(cfg, "max_unobserved_room_hops", 1))
+        adjacency_dilation = int(self._cfg_get(cfg, "room_adjacency_dilation", 1))
+        area_source = str(self._cfg_get(cfg, "area_source", "explored")).lower()
+        segmentation_method = str(
+            self._cfg_get(cfg, "segmentation_method", "dilation_watershed")).lower()
+
+        _, unoccupied_high = self.get_island_around_pts(pts, height=room_height)
+        room_envelope = self._get_room_segmentation_envelope(
+            area_source=area_source, unoccupied_high=unoccupied_high)
+        room_area = room_envelope.copy()
+        if np.count_nonzero(room_area) < min_room_area:
+            self.clear_room_map()
+            return False
+
+        if close_iterations > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3))
+            room_area_u8 = (room_area.astype(np.uint8) * 255)
+            room_area = (cv2.morphologyEx(
+                room_area_u8, cv2.MORPH_CLOSE, kernel,
+                iterations=close_iterations) > 0)
+            room_area &= room_envelope
+
+        if segmentation_method == "region_growing_watershed":
+            regions = self._region_growing_watershed_room_regions(
+                room_area=room_area, min_room_area=min_room_area,
+                seed_area_min=seed_area_min,
+                seed_radius=int(self._cfg_get(cfg, "region_seed_radius", 2)),
+                seed_min_distance=int(
+                    self._cfg_get(cfg, "region_seed_min_distance", 12)),
+            )
+        else:
+            if segmentation_method != "dilation_watershed":
+                logging.warning(
+                    "Unknown room_segmentation.segmentation_method=%s; "
+                    "falling back to dilation_watershed.", segmentation_method)
+            seeds = self._find_room_seed_masks(
+                room_area, min_area=seed_area_min, max_area=seed_area_max,
+                max_iterations=max_dilation_iter)
+            if len(seeds) == 0:
+                regions = self._connected_room_regions(room_area, min_room_area)
+            else:
+                regions = self._watershed_room_regions(room_area, seeds, min_room_area)
+
+        if len(regions) == 0:
+            self.clear_room_map()
+            return False
+
+        regions = self._filter_room_regions_by_observed_adjacency(
+            regions=regions, observed_threshold=observed_threshold,
+            max_unobserved_hops=max_unobserved_hops,
+            adjacency_dilation=adjacency_dilation)
+        if len(regions) == 0:
+            self.clear_room_map()
+            return False
+
+        self._commit_room_regions(regions, stable_iou_threshold,
+                                  observed_threshold=observed_threshold)
+        self._assign_frontiers_to_rooms()
+        return True
+
+    def clear_room_map(self):
+        self.room_map = np.zeros(self._vol_dim[:2], dtype=int)
+        self.room_regions = []
+        for frontier in self.frontiers:
+            frontier.room_id = -1
