@@ -231,9 +231,29 @@ def run_episode(
     scene = None
     tsdf_planner = None
     try:
+        # Load concept graph config if not provided
+        import yaml
+        from omegaconf import OmegaConf, DictConfig
+
+        if isinstance(cfg, dict):
+            cfg = OmegaConf.create(cfg)
+        elif hasattr(cfg, "concept_graph_config_path"):
+            pass  # OmegaConf object
+        else:
+            from easydict import EasyDict
+            cfg = EasyDict(cfg)
+
+        # Load separate concept graph config
+        graph_cfg_path = getattr(cfg, "concept_graph_config_path", None)
+        if graph_cfg_path and os.path.exists(graph_cfg_path):
+            graph_cfg = OmegaConf.load(graph_cfg_path)
+            OmegaConf.resolve(graph_cfg)
+        else:
+            graph_cfg = getattr(cfg, "scene_graph", {})
+
         # Load scene
         scene = Scene(
-            scene_id=scene_id, cfg=cfg, graph_cfg=cfg.scene_graph,
+            scene_id=scene_id, cfg=cfg, graph_cfg=graph_cfg,
             detection_model=detection_model, sam_predictor=sam_predictor,
             clip_model=clip_model, clip_preprocess=clip_preprocess,
             clip_tokenizer=clip_tokenizer,
@@ -617,24 +637,21 @@ if __name__ == "__main__":
 
     # Load config
     import yaml
-    from easydict import EasyDict as edict
+    from omegaconf import OmegaConf
 
     with open(args.cfg, "r") as f:
-        cfg = edict(yaml.safe_load(f))
+        cfg = OmegaConf.create(yaml.safe_load(f))
+    OmegaConf.resolve(cfg)
 
     # Load models (same as run_aeqa_evaluation.py)
-    from ultralytics import YOLO
-    from segment_anything import sam_model_registry, SamPredictor
-    import clip
+    from ultralytics import SAM, YOLOWorld
+    import open_clip
 
-    detection_model = YOLO(cfg.detection_model_path)
-    sam = sam_model_registry[cfg.sam_model_type](
-        checkpoint=cfg.sam_checkpoint_path)
-    sam.cuda()
-    sam_predictor = SamPredictor(sam)
-    clip_model, clip_preprocess = clip.load(cfg.clip_model_type, device="cuda")
-    import clip as clip_module
-    clip_tokenizer = clip_module
+    detection_model = YOLOWorld(cfg.yolo_model_name)
+    sam_predictor = SAM(cfg.sam_model_name)
+    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", "laion2b_s34b_b79k")
+    clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
 
     result = run_episode(
         scene_id=args.scene,
