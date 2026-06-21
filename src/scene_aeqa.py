@@ -11,6 +11,7 @@ import logging
 from collections import Counter
 from typing import List, Optional, Tuple, Dict, Union
 import copy
+from PIL import Image
 
 from habitat_sim.utils.common import (
     quat_to_coeffs,
@@ -940,3 +941,270 @@ class Scene:
             logging.info(f"{snapshot_id}:")
             for obj_str in obj_list:
                 logging.info(f"\t{obj_str}")
+
+
+# ── GroundingDINO Navigation Chain ──────────────────────────────────────
+
+_gd_model = None
+_gd_transform = None
+
+
+def _load_gd_model(gd_dir="/root/ContextNav/GroundingDINO", device="cuda"):
+    """Lazy-load GroundingDINO Swin-T model and transform."""
+    global _gd_model, _gd_transform
+    if _gd_model is not None:
+        return _gd_model, _gd_transform
+
+    import sys
+    if gd_dir not in sys.path:
+        sys.path.insert(0, gd_dir)
+
+    import groundingdino.datasets.transforms as gd_transforms
+    from groundingdino.util.inference import load_model as gd_load_model
+
+    config_path = os.path.join(
+        gd_dir, "groundingdino/config/GroundingDINO_SwinT_OGC.py")
+    weights_path = "/root/ContextNav/data/groundingdino_swint_ogc.pth"
+
+    logging.info(f"Loading GroundingDINO from {config_path}")
+    _gd_model = gd_load_model(config_path, weights_path, device=device)
+
+    _gd_transform = gd_transforms.Compose([
+        gd_transforms.RandomResize([800], max_size=1333),
+        gd_transforms.ToTensor(),
+        gd_transforms.Normalize([0.485, 0.456, 0.406],
+                                [0.229, 0.224, 0.225]),
+    ])
+    return _gd_model, _gd_transform
+
+
+def _gd_detect(rgb, prompt, box_threshold=0.30, text_threshold=0.25):
+    """Run GroundingDINO on a single RGB image.
+
+    Returns: (best_bbox_xyxy, best_phrase, best_score, image_pil) or
+             (None, None, 0, None) if nothing detected.
+    """
+    from groundingdino.util.inference import predict as gd_predict
+
+    gd_model, gd_transform = _load_gd_model()
+    image_pil = Image.fromarray(rgb)
+    W, H = image_pil.size
+    image_tensor, _ = gd_transform(image_pil, None)
+
+    with torch.no_grad():
+        boxes, logits, phrases = gd_predict(
+            model=gd_model, image=image_tensor, caption=prompt,
+            box_threshold=box_threshold, text_threshold=text_threshold,
+            device="cuda",
+        )
+
+    if len(boxes) == 0:
+        return None, None, 0, image_pil
+
+    boxes_xyxy = boxes.clone()
+    boxes_xyxy[:, :2] -= boxes_xyxy[:, 2:] / 2
+    boxes_xyxy[:, 2:] += boxes_xyxy[:, :2]
+    boxes_xyxy *= torch.tensor([W, H, W, H])
+
+    top1 = int(torch.argmax(logits).item())
+    score = float(logits[top1].item())
+    bbox = boxes_xyxy[top1].cpu().numpy()
+    phrase = phrases[top1]
+
+    return bbox, phrase, score, image_pil
+
+
+def grounded_navigate_to_object(
+    scene, tsdf_planner, pts, angle, object_desc,
+    max_steps=20, gd_dir="/root/ContextNav/GroundingDINO",
+):
+    """GD 导航链：检测目标→计算导航点→移动。
+
+    Pipeline:
+      1. Render current view
+      2. GroundingDINO detect object_desc
+      3. SAM mask on best detection
+      4. 3D back-project mask to TSDF coords
+      5. Find navigable point near 3D position
+      6. Use pathfinder to navigate step-by-step
+
+    Returns: (new_pts, new_angle, success_bool, status_text, images_list)
+        images_list: list of (tag, rgb_image) collected during navigation
+    """
+    from PIL import Image
+    from src.habitat import pose_habitat_to_tsdf, pos_habitat_to_normal
+    from src.conceptgraph.slam.utils import (
+        detections_to_obj_pcd_and_bbox,
+        init_process_pcd,
+        get_bounding_box,
+    )
+    from src.geom import get_cam_intr
+
+    images = []
+    cam_intr = scene.cam_intrinsic
+    cfg_cg = scene.cfg_cg
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Check if SAM predictor is available
+    if scene.sam_predictor is None:
+        # Fallback: load ultralytics SAM
+        try:
+            from ultralytics import SAM
+        except ImportError:
+            return pts, angle, False, "SAM not available", images
+
+    steps_taken = 0
+
+    for step in range(max_steps):
+        steps_taken = step + 1
+
+        # 1. Render current view
+        obs, cam_pose = scene.get_observation(pts, angle)
+        rgb = obs["color_sensor"]
+        depth = obs["depth_sensor"]
+        images.append((f"step{step}_view", rgb.copy()))
+
+        # 2. GroundingDINO detect
+        bbox, phrase, score, image_pil = _gd_detect(rgb, object_desc)
+        if bbox is None:
+            logging.info(f"  GD step {step}: no detection for '{object_desc}'")
+            continue
+
+        logging.info(
+            f"  GD step {step}: detected '{phrase}' score={score:.3f} "
+            f"bbox={[round(x, 1) for x in bbox.tolist()]}"
+        )
+
+        # 3. SAM mask
+        try:
+            from ultralytics import SAM as SAMModel
+            sam = SAMModel("sam_b.pt")
+            sam_out = sam.predict(rgb, bboxes=[bbox.tolist()], verbose=False)
+            mask = sam_out[0].masks.data.cpu().numpy()[0].astype(bool)
+            del sam
+        except Exception as e:
+            logging.warning(f"  GD step {step}: SAM failed: {e}")
+            # Fallback: use the GD bbox as a rectangular mask
+            mask = np.zeros(rgb.shape[:2], dtype=bool)
+            x1, y1, x2, y2 = bbox.astype(int)
+            mask[y1:y2, x1:x2] = True
+
+        images.append((f"step{step}_mask", mask.astype(np.uint8) * 255))
+
+        # 4. 3D back-project
+        cam_pose_tsdf = pose_habitat_to_tsdf(cam_pose)
+        try:
+            obj_list = detections_to_obj_pcd_and_bbox(
+                depth_array=depth,
+                masks=mask[None, :, :].astype(np.float32),
+                cam_K=cam_intr,
+                image_rgb=rgb,
+                trans_pose=cam_pose_tsdf,
+                camera_convention="z_forward",
+                min_points_threshold=5,
+                spatial_sim_type=cfg_cg.spatial_sim_type,
+                obj_pcd_max_points=cfg_cg.obj_pcd_max_points,
+                downsample_voxel_size=cfg_cg.downsample_voxel_size,
+                dbscan_remove_noise=cfg_cg.dbscan_remove_noise,
+                dbscan_eps=cfg_cg.dbscan_eps,
+                dbscan_min_points=cfg_cg.dbscan_min_points,
+                run_dbscan=cfg_cg.dbscan_remove_noise,
+                device=device,
+            )
+        except Exception as e:
+            logging.warning(f"  GD step {step}: back-project failed: {e}")
+            continue
+
+        if obj_list is None or len(obj_list) == 0 or obj_list[0] is None:
+            logging.info(f"  GD step {step}: back-project returned None")
+            continue
+
+        obj = obj_list[0]
+        pcd = obj["pcd"]
+        if len(pcd.points) == 0:
+            logging.info(f"  GD step {step}: empty point cloud")
+            continue
+
+        pcd = init_process_pcd(
+            pcd=pcd,
+            downsample_voxel_size=cfg_cg.downsample_voxel_size,
+            dbscan_remove_noise=cfg_cg.dbscan_remove_noise,
+            dbscan_eps=cfg_cg.dbscan_eps,
+            dbscan_min_points=cfg_cg.dbscan_min_points,
+        )
+        bbox_3d = get_bounding_box(
+            spatial_sim_type=cfg_cg.spatial_sim_type, pcd=pcd)
+
+        # Target in normal frame (TSDF coords)
+        target_normal = bbox_3d.center.copy()
+
+        # Convert to habitat coords for pathfinder query
+        target_habitat = pos_normal_to_habitat(target_normal.copy())
+        target_habitat[2] = float(pts[1])  # set to agent eye level
+
+        logging.info(
+            f"  GD step {step}: 3D target "
+            f"normal={target_normal.tolist()} "
+            f"habitat={target_habitat.tolist()}"
+        )
+
+        # 5. Find navigable point near target
+        nav_habitat = None
+        for radius in [1.0, 2.0, 5.0, 10.0]:
+            for _ in range(10):
+                cand = scene.pathfinder.get_random_navigable_point_near(
+                    circle_center=target_habitat, radius=radius)
+                if np.isnan(cand).any():
+                    continue
+                if abs(cand[1] - pts[1]) > 0.2:
+                    continue
+                nav_habitat = cand
+                break
+            if nav_habitat is not None:
+                break
+
+        if nav_habitat is None:
+            logging.warning(f"  GD step {step}: no navigable point near target")
+            continue
+
+        # 6. Navigate using pathfinder
+        nav_voxel = tsdf_planner.habitat2voxel(nav_habitat)[:2]
+        cur_voxel = tsdf_planner.habitat2voxel(pts)[:2]
+        dist = np.linalg.norm(nav_voxel - cur_voxel)
+
+        if dist < 1:
+            # Already there
+            logging.info(f"  GD step {step}: already at target")
+            return pts, angle, True, f"Reached target: {object_desc}", images
+
+        # Find a point along direction one step away
+        direction = target_habitat.copy()
+        direction[1] = pts[1]  # match height
+        direction -= pts
+        direction_norm = np.linalg.norm(direction[[0, 2]])
+        if direction_norm > 1e-6:
+            direction = direction / direction_norm
+
+        step_dist = min(2.0, direction_norm * 0.5)
+        next_pt = pts.copy() + direction * step_dist
+
+        # Use pathfinder to snap to navigable point
+        nav = scene.pathfinder.get_random_navigable_point_near(
+            circle_center=next_pt, radius=2.0, max_tries=20)
+        if not np.isnan(nav).any():
+            pts = nav
+            angle = np.arctan2(direction[2], direction[0]) - np.pi / 2
+        else:
+            logging.warning(f"  GD step {step}: no navigable point; trying random step")
+            # Just try to step forward a bit
+            fwd = np.array([
+                np.cos(angle + np.pi / 2), 0.0, np.sin(angle + np.pi / 2)
+            ])
+            next_pt = pts.copy() + fwd * 1.0
+            nav = scene.pathfinder.get_random_navigable_point_near(
+                circle_center=next_pt, radius=2.0)
+            if not np.isnan(nav).any():
+                pts = nav
+
+    # Max steps reached without finding target
+    return pts, angle, False, f"Max steps ({max_steps}) reached", images
