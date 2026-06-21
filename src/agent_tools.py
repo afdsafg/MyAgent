@@ -54,19 +54,22 @@ def silent_perception_step(
         scene.periodic_cleanup_objects(
             frame_idx=cnt_step * 3 + view_idx, pts=pts)
 
-    # Snapshot 存档
+    # Snapshot 存档 — 每步始终保存 3 视角快照
     scene.update_snapshots(
         obj_ids=set(all_added_obj_ids), min_detection=cfg.min_detection)
 
-    # 存档到 MemoryStore (only when objects were detected)
-    if all_added_obj_ids:
-        room_id = tsdf_planner.get_room_id_at(
-            tsdf_planner.habitat2voxel(pts)[:2])
-        for i, view_rgb in enumerate(rgb_views):
-            objs_in_view = [scene.objects[oid]["class_name"]
-                            for oid in all_added_obj_ids
-                            if oid in scene.objects]
-            memory_store.add_snapshot(
+    room_id = tsdf_planner.get_room_id_at(
+        tsdf_planner.habitat2voxel(pts)[:2])
+    for i, view_rgb in enumerate(rgb_views):
+        # 收集当前视图中所有 object（不仅仅是新增的）
+        objs_in_view = [
+            scene.objects[oid]["class_name"]
+            for oid in scene.objects
+            if np.linalg.norm(
+                scene.objects[oid]["bbox"].center[[0, 2]] - pts[[0, 2]]
+            ) < cfg.scene_graph.obj_include_dist + 0.5
+        ]
+        memory_store.add_snapshot(
             snapshot_id=f"step{cnt_step}_view{i}",
             image=view_rgb,
             room_id=room_id,

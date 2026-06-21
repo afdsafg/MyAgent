@@ -430,18 +430,20 @@ def run_episode(
                         scene, pts, angle, args)
 
                 elif tool == "navigate_to_object":
+                    old_pts = pts.copy()
                     new_pts, new_angle, success, status = navigate_to_object(
                         scene, tsdf_planner, pts, angle, args)
                     pts, angle = new_pts, new_angle
                     obs_text = f"navigate_to_object result: success={success}, status={status}"
-                    # Silent perception after navigation
-                    silent_perception_step(
-                        scene, tsdf_planner, pts, angle, total_steps,
-                        memory_store, cam_intr, cfg, detection_model,
-                        sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-                    )
-                    tsdf_planner.update_frontier_map(
-                        pts, cfg.planner, scene, total_steps, save_frontier_image=False)
+                    # 只在 agent 确实移动了才做 silent perception
+                    if success and np.linalg.norm(pts - old_pts) > 0.1:
+                        silent_perception_step(
+                            scene, tsdf_planner, pts, angle, total_steps,
+                            memory_store, cam_intr, cfg, detection_model,
+                            sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
+                        )
+                        tsdf_planner.update_frontier_map(
+                            pts, cfg.planner, scene, total_steps, save_frontier_image=False)
                     rooms_info = _format_rooms_info(tsdf_planner)
                     frontiers_info = _format_frontiers_info(tsdf_planner)
                     obs_text += f"\n{rooms_info}\n{frontiers_info}"
