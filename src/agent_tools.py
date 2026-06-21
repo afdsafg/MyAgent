@@ -70,25 +70,25 @@ def silent_perception_step(
     if pos_changed:
         room_id = tsdf_planner.get_room_id_at(
             tsdf_planner.habitat2voxel(pts)[:2])
-    for i, view_rgb in enumerate(rgb_views):
-        # 收集当前视图中所有 object（不仅仅是新增的）
-        objs_in_view = [
-            scene.objects[oid]["class_name"]
-            for oid in scene.objects
-            if np.linalg.norm(
-                scene.objects[oid]["bbox"].center[[0, 2]] - pts[[0, 2]]
-            ) < cfg.scene_graph.obj_include_dist + 0.5
-        ]
-        memory_store.add_snapshot(
-            snapshot_id=f"step{cnt_step}_view{i}",
-            image=view_rgb,
-            room_id=room_id,
-            objects_in_view=objs_in_view,
-            position_3d=pts.tolist(),
-            clip_model=clip_model,
-            clip_preprocess=clip_preprocess,
-            clip_tokenizer=clip_tokenizer,
-        )
+        for i, view_rgb in enumerate(rgb_views):
+            # 收集当前视图中所有 object（不仅仅是新增的）
+            objs_in_view = [
+                scene.objects[oid]["class_name"]
+                for oid in scene.objects
+                if np.linalg.norm(
+                    scene.objects[oid]["bbox"].center[[0, 2]] - pts[[0, 2]]
+                ) < cfg.scene_graph.obj_include_dist + 0.5
+            ]
+            memory_store.add_snapshot(
+                snapshot_id=f"step{cnt_step}_view{i}",
+                image=view_rgb,
+                room_id=room_id,
+                objects_in_view=objs_in_view,
+                position_3d=pts.tolist(),
+                clip_model=clip_model,
+                clip_preprocess=clip_preprocess,
+                clip_tokenizer=clip_tokenizer,
+            )
 
     return pts, angle
 
