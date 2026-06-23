@@ -127,9 +127,9 @@ You operate in a 6-stage workflow. In each stage you have specific goals and too
 Available tools:
 - observe_panorama: Take a 7-view panorama. Returns a mosaic image showing all directions and room/frontier information.
 - view_direction <direction>: Look toward "left", "right", "forward", or "backward". Returns the RGB image from that direction.
-- navigate_to_object <object_description>: Use GroundingDINO to detect the described object and navigate toward it. Returns success/failure and status.
-- navigate_to_seed <room_id>: Face toward the center of the specified room.
-- navigate_to_frontier <frontier_id>: Face toward the specified unexplored frontier.
+- navigate_to_object <object_description>: Use GroundingDINO to detect the described object and navigate toward it. Returns success/failure and status. The <object_description> MUST be a concrete noun phrase that GroundingDINO can detect, e.g. "oven", "the red door", "towel hanging on oven handle", "coffee table". Do NOT use room names, directions, or abstract concepts — only physical objects.
+- navigate_to_seed <room_id>: Navigate toward the center of the specified room (e.g. "1").
+- navigate_to_frontier <frontier_id>: Navigate toward the specified unexplored frontier (e.g. "0").
 - query_memory <text_query>: Search past observations for relevant images. Returns a mosaic of matching snapshots (max 2 queries per episode).
 - submit_answer <answer_text>: Submit your final answer to the question.
 
@@ -168,8 +168,8 @@ Based on the panorama you just observed, look at the objects and rooms visible.
 For the question: "{question}"
 
 Do you see the target objects or relevant clues in the current view?
-- If YES: Navigate in that direction with navigate_to_object or view_direction.
-- If NO: Choose the most promising unexplored frontier or room to explore.
+- If YES: Call navigate_to_object with a SPECIFIC physical object name (e.g. "oven", "the red door", "towel"). The argument must be a concrete noun phrase a detector can find — NOT a room name, direction, or abstract concept.
+- If NO: Call navigate_to_frontier or navigate_to_seed to explore unexplored areas.
 
 Available rooms: {rooms_info}
 Available frontiers: {frontiers_info}
@@ -177,10 +177,15 @@ Available frontiers: {frontiers_info}
 
 STAGE3_PROMPT = """Stage 3: Targeted Navigation
 
-You decided to search for: "{target}". 
+You are looking for objects relevant to: "{question}"
 
-Try using navigate_to_object with a description that matches what you're looking for. 
-If GD navigation fails, try viewing different directions or navigating to promising frontiers/rooms.
+Based on what you observed in the panorama, identify the specific physical object that is most likely to help answer the question. Then call navigate_to_object with a concrete noun phrase describing that object.
+
+IMPORTANT: The argument to navigate_to_object must be a specific physical object name that a detector can find in an image. Examples:
+- GOOD: "oven", "the red door", "towel", "coffee table", "kitchen counter"
+- BAD: "forward", "room 1", "the kitchen", "explore", "left side"
+
+If you cannot identify a specific object to navigate to, use view_direction to look around, or navigate_to_frontier / navigate_to_seed to explore other areas.
 
 Available rooms: {rooms_info}
 Available frontiers: {frontiers_info}
@@ -406,9 +411,8 @@ def run_episode(
                     question=question, rooms_info=rooms_info,
                     frontiers_info=frontiers_info)
             elif current_stage == 3:
-                target = vlm_parsed.get("target", vlm_parsed.get("arguments", "relevant objects"))
                 stage_prompt = STAGE3_PROMPT.format(
-                    target=target, rooms_info=rooms_info,
+                    question=question, rooms_info=rooms_info,
                     frontiers_info=frontiers_info)
             elif current_stage == 4:
                 stage_prompt = STAGE4_PROMPT.format(
@@ -437,6 +441,18 @@ def run_episode(
                 reasoning = vlm_parsed.get("reasoning", "")
 
                 logger.info(f"Stage {current_stage} decision {stage_decisions} (low-level steps={_low_level_steps()}): tool={tool}, args={args}")
+
+                # Validate navigate_to_object has a concrete object description
+                if tool == "navigate_to_object":
+                    if not _is_valid_object_desc(args):
+                        logger.warning(f"Invalid object description for navigate_to_object: '{args}'")
+                        context.add_message("user",
+                            f"ERROR: navigate_to_object requires a concrete physical object name "
+                            f"(e.g. 'oven', 'the red door', 'towel'). "
+                            f"You provided: '{args}'. "
+                            f"Please call navigate_to_object again with a specific object name, "
+                            f"or use a different tool (view_direction, navigate_to_frontier, navigate_to_seed).")
+                        continue
 
                 # Check for answer submission
                 if tool == "submit_answer":
@@ -585,6 +601,38 @@ def run_episode(
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
+
+# Invalid arguments for navigate_to_object — these are not object descriptions
+_NAV_OBJ_INVALID = {
+    "", "forward", "backward", "left", "right", "up", "down",
+    "explore", "navigate", "search", "look", "go", "move",
+    "room", "room 0", "room 1", "room 2", "room 3", "room 4",
+    "frontier", "frontier 0", "frontier 1", "frontier 2",
+    "yes", "no", "true", "false", "none", "null",
+    "the kitchen", "the bathroom", "the bedroom", "the living room",
+    "kitchen", "bathroom", "bedroom", "living room",
+}
+
+def _is_valid_object_desc(desc: str) -> bool:
+    """Check if a string is a valid concrete object description for GroundingDINO.
+
+    Rejects empty strings, directions, room names, and other non-object terms.
+    """
+    if not desc or not isinstance(desc, str):
+        return False
+    desc_clean = desc.strip().lower()
+    if desc_clean in _NAV_OBJ_INVALID:
+        return False
+    if len(desc_clean) < 2:
+        return False
+    # Reject pure numbers (room/frontier IDs)
+    try:
+        int(desc_clean)
+        return False
+    except ValueError:
+        pass
+    return True
+
 
 def _build_messages(context: ContextManager) -> List[dict]:
     """Build the message list for VLM from context manager state."""
