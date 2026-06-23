@@ -256,10 +256,11 @@ def observe_panorama(
                 ax.axis('off')
 
     fig.tight_layout()
-    # Rasterize to numpy
+    # Rasterize to numpy (use renderer.buffer_rgba for backend compatibility)
     fig.canvas.draw()
-    mosaic = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    mosaic = mosaic.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    renderer = fig.canvas.get_renderer()
+    raw = renderer.buffer_rgba()
+    mosaic = np.asarray(raw)[:, :, :3]  # drop alpha
     plt.close(fig)
 
     mosaic_b64 = numpy_to_base64(mosaic)
