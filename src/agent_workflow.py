@@ -453,6 +453,7 @@ def run_episode(
                         "view_idx": view_idx,
                         "angle": view_info["angle"],
                         "cam_pose": view_info["cam_pose"],
+                        "rgb": view_info["rgb"],
                     }
                     current_stage = 3
                 else:
@@ -514,8 +515,7 @@ def run_episode(
             elif current_stage == 3:
                 # ── Stage 3: Object Selection (VLM call 3) ──
                 logger.info("--- Stage 3: Object Selection ---")
-                view_info = panorama_views[pending_view["view_idx"]]
-                rgb = view_info["rgb"]
+                rgb = pending_view["rgb"]
                 stage_prompt = STAGE3_PROMPT.format(
                     view_idx=pending_view["view_idx"], question=question)
                 messages = [
@@ -564,15 +564,23 @@ def run_episode(
             elif current_stage == 5:
                 # ── Stage 5: Re-decision After Arrival (VLM call 4) ──
                 logger.info("--- Stage 5: Re-decision After Arrival ---")
-                # Render 3 frontal views (left 60°, front, right 60°)
+                # Render 3 frontal views (left 60°, front, right 60°) at current position
                 obs_angles = [angle - np.pi / 3, angle, angle + np.pi / 3]
                 frontal_views = []
-                for ang in obs_angles:
-                    obs, _ = scene.get_observation(pts, ang)
-                    frontal_views.append(obs["color_sensor"][..., :3])
+                frontal_rgb = []
+                for i, ang in enumerate(obs_angles):
+                    obs, cam_pose = scene.get_observation(pts, ang)
+                    rgb = obs["color_sensor"][..., :3]
+                    frontal_rgb.append(rgb)
+                    frontal_views.append({
+                        "view_idx": i,
+                        "angle": float(ang),
+                        "cam_pose": cam_pose,
+                        "rgb": rgb,
+                    })
 
                 # Build 3-view mosaic
-                mosaic_3 = make_mosaic(frontal_views, target_h=300)
+                mosaic_3 = make_mosaic(frontal_rgb, target_h=300)
 
                 stage_prompt = STAGE5_PROMPT.format(question=question)
                 messages = [
@@ -609,12 +617,13 @@ def run_episode(
                     current_stage = "done"
                 elif tool == "navigate_to_object":
                     view_idx = int(vlm_parsed.get("view_idx", 1))
-                    view_idx = max(0, min(view_idx, 2))
-                    view_info = panorama_views[view_idx] if view_idx < len(panorama_views) else panorama_views[0]
+                    view_idx = max(0, min(view_idx, len(frontal_views) - 1))
+                    view_info = frontal_views[view_idx]
                     pending_view = {
                         "view_idx": view_idx,
                         "angle": view_info["angle"],
                         "cam_pose": view_info["cam_pose"],
+                        "rgb": view_info["rgb"],
                     }
                     current_stage = 3
                 elif tool == "explore_other_room":
