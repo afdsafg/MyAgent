@@ -749,12 +749,23 @@ def run_episode(
 
 
 def _register_new_seeds(seed_view_manager, tsdf_planner, scene, agent_pts):
-    """Scan room_regions and register any new seeds not yet in SeedViewManager."""
+    """Scan room_regions and register any new seeds not yet in SeedViewManager.
+
+    A seed is any room OTHER than the one the agent is currently in.
+    room_state can be 'observed', 'hypothesis', or 'unknown' — all are
+    valid seeds (we want to navigate to other rooms to explore them).
+    """
     if not hasattr(tsdf_planner, "room_regions") or not tsdf_planner.room_regions:
         return
     existing_ids = set(seed_view_manager.seeds.keys())
+    # Find which room the agent is currently in
+    agent_voxel = tsdf_planner.habitat2voxel(agent_pts)[:2]
+    agent_room_id = tsdf_planner.get_room_id_at(agent_voxel)
     for room in tsdf_planner.room_regions:
-        if room.room_id not in existing_ids and room.room_state != "explored":
+        # Skip the room the agent is already in
+        if room.room_id == agent_room_id:
+            continue
+        if room.room_id not in existing_ids:
             try:
                 seed_view_manager.register_seed(
                     room.room_id, room.center.astype(np.float64),
