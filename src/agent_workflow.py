@@ -62,13 +62,18 @@ def call_vlm(
 
     # Build the last message with optional image
     last_msg = api_messages[-1]
-    if image_b64:
-        content_list = [
-            {"type": "image_url", "image_url": {
-                "url": f"data:image/png;base64,{image_b64}"}},
-            {"type": "text", "text": last_msg["content"]},
-        ]
-        api_messages[-1] = {"role": last_msg["role"], "content": content_list}
+    # Handle numpy array input (convert to base64)
+    if image_b64 is not None:
+        if isinstance(image_b64, np.ndarray):
+            from src.agent_image_utils import numpy_to_base64
+            image_b64 = numpy_to_base64(image_b64)
+        if image_b64:  # now it's a string (or empty)
+            content_list = [
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/png;base64,{image_b64}"}},
+                {"type": "text", "text": last_msg["content"]},
+            ]
+            api_messages[-1] = {"role": last_msg["role"], "content": content_list}
 
     payload = {
         "model": model_name,
