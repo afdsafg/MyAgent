@@ -1024,8 +1024,15 @@ def grounded_navigate_to_object(
     max_consecutive_failures=5,
     max_iterations=5, converge_dist_voxels=5,
     max_nav_steps_per_iter=15,
+    memory_store=None, cam_intr_ext=None, cfg_ext=None,
+    detection_model=None, sam_predictor=None,
+    clip_model=None, clip_preprocess=None, clip_tokenizer=None,
+    cnt_step_base=0, step_budget=None,
 ):
     """GD 导航链：检测目标→3D反投影→迭代螺旋搜索导航。
+
+    每迭代使用共享的 _navigate_to_target_with_agent_step() 助手，
+    确保每个子步都调用 silent_perception_step（场景图更新 + TSDF + 快照存档）。
 
     Fixes from HM-GE stage-3 notes:
     - Camera convention: pass raw Habitat cam_pose (OpenGL z-back) to
@@ -1036,7 +1043,7 @@ def grounded_navigate_to_object(
     - Use pcd mean (x,y) instead of OBB center (pulled by z-clip).
     - Pin normal[2] (height) to floor, NOT normal[1] (horizontal y).
     - Replace 4-radius random sampling with iterative spiral search.
-    - Per-step map integration during navigation to expand navigable area.
+    - Per-step map integration via silent_perception_step.
 
     Returns: (new_pts, new_angle, success_bool, status_text, images_list)
     """
@@ -1162,7 +1169,6 @@ def grounded_navigate_to_object(
     arrived_any = False
     map_h, map_w = tsdf_planner._tsdf_vol_cpu.shape[:2]
     max_spiral_radius = max(map_h, map_w)  # search the entire map
-    from src.habitat import pose_habitat_to_tsdf
 
     for iteration in range(1, max_iterations + 1):
         logging.info(f"  GD iter {iteration}/{max_iterations}, pts={cur_pts.tolist()}")
@@ -1249,73 +1255,24 @@ def grounded_navigate_to_object(
             converged = True
             break
 
-        # 5. 导航到螺旋点 — 使用 target_type="image" 直接设置 habitat 位置
-        tsdf_planner.max_point = None
-        tsdf_planner.target_point = None
-        set_ok = tsdf_planner.set_next_navigation_point(
-            choice=nav_habitat, pts=cur_pts, objects=scene.objects,
-            cfg=cfg.planner, pathfinder=scene.pathfinder,
-            target_type="image", observe_snapshot=False,
-        )
-        if not set_ok:
-            logging.warning(
-                f"  GD iter {iteration}: set_next_navigation_point failed, "
-                f"teleporting to spiral point")
-            tsdf_planner.max_point = None
-            tsdf_planner.target_point = None
-            cur_pts = nav_habitat.copy()
-            continue
-
-        # 6. 每步: agent_step → phase1 融合 → refresh_grids → update_frontier_map
-        arrived = False
-        for nav_step in range(1, max_nav_steps_per_iter + 1):
-            result = tsdf_planner.agent_step(
-                pts=cur_pts, angle=cur_angle, objects=scene.objects,
-                snapshots=scene.snapshots, pathfinder=scene.pathfinder,
-                cfg=cfg.planner, save_visualization=False,
+        # 5. 导航到螺旋点 — 使用共享助手，每子步自动 silent_perception + 网格刷新
+        from src.agent_tools import _navigate_to_target_with_agent_step
+        nav_pts, nav_angle, arrived, nav_status, substeps = (
+            _navigate_to_target_with_agent_step(
+                scene, tsdf_planner, cur_pts, cur_angle, nav_habitat, cfg,
+                memory_store, cam_intr, detection_model, sam_predictor,
+                clip_model, clip_preprocess, clip_tokenizer,
+                cnt_step_base + iteration * max_nav_steps_per_iter,
+                max_substeps=max_nav_steps_per_iter,
+                target_type="image",
+                update_planning_grids=True,
             )
-            if result[0] is None:
-                tsdf_planner.max_point = None
-                tsdf_planner.target_point = None
-                break
-
-            cur_pts, cur_angle, _, _, _, target_arrived = result
-
-            # Per-step map integration: render phase-1 views + integrate TSDF
-            view_angles = [
-                cur_angle - np.pi / 3, cur_angle, cur_angle + np.pi / 3
-            ]
-            for va in view_angles:
-                vobs, vcam_pose = scene.get_observation(cur_pts, va)
-                tsdf_planner.integrate(
-                    color_im=vobs["color_sensor"],
-                    depth_im=vobs["depth_sensor"],
-                    cam_intr=cam_intr,
-                    cam_pose=pose_habitat_to_tsdf(vcam_pose),
-                    obs_weight=1.0,
-                    margin_h=int(cfg.margin_h_ratio * cfg.img_height),
-                    margin_w=int(cfg.margin_w_ratio * cfg.img_width),
-                    explored_depth=cfg.explored_depth,
-                )
-
-            # Refresh grids after integration so spiral search sees expanded map
-            tsdf_planner.refresh_planner_grids(cur_pts)
-
-            # Update frontier map (non-fatal)
-            try:
-                tsdf_planner.update_frontier_map(
-                    cur_pts, cfg.planner, scene, iteration * 100 + nav_step,
-                    save_frontier_image=False)
-            except Exception as e:
-                logging.warning(f"  GD iter {iteration} step {nav_step}: update_frontier_map failed: {e}")
-
-            if target_arrived:
-                arrived = True
-                break
-
-        # Clear nav state
-        tsdf_planner.max_point = None
-        tsdf_planner.target_point = None
+        )
+        cur_pts, cur_angle = nav_pts, nav_angle
+        logging.info(
+            f"  GD iter {iteration}: nav result arrived={arrived} "
+            f"status={nav_status} substeps={substeps}"
+        )
 
         if arrived:
             arrived_any = True
