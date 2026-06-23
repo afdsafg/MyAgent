@@ -1068,7 +1068,7 @@ def grounded_navigate_to_object(
     rgb = obs["color_sensor"]
     depth = obs["depth_sensor"]
 
-    bbox, phrase, score = _gd_detect(rgb, object_desc, gd_model)
+    bbox, phrase, score = _gd_detect(rgb, object_desc)
     if bbox is None:
         return pts, angle, False, f"GD no detection for '{object_desc}'", images
 
