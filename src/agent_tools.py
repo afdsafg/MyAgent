@@ -315,7 +315,7 @@ def navigate_to_object(
     view_idx, view_angle, view_cam_pose, object_desc,
     memory_store, cam_intr, cfg, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
-    max_steps=20, step_budget=None, gd_model=None,
+    max_steps=20, step_budget=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """GD 导航到指定物体。返回 (pts, angle, success, status, img_b64)。
 
@@ -344,7 +344,6 @@ def navigate_to_object(
         clip_model=clip_model, clip_preprocess=clip_preprocess,
         clip_tokenizer=clip_tokenizer,
         cnt_step_base=cnt_step, step_budget=step_budget,
-        gd_model=gd_model,
     )
 
     # GD 导航内部每子步已做 silent_perception + refresh + update_frontier

@@ -556,7 +556,7 @@ def run_episode(
                     detection_model=detection_model, sam_predictor=sam_predictor,
                     clip_model=clip_model, clip_preprocess=clip_preprocess,
                     clip_tokenizer=clip_tokenizer, cnt_step=total_steps,
-                    step_budget=step_budget, gd_model=detection_model,
+                    step_budget=step_budget,
                 )
                 total_steps += 1
                 current_stage = 5

@@ -1030,7 +1030,6 @@ def grounded_navigate_to_object(
     detection_model=None, sam_predictor=None,
     clip_model=None, clip_preprocess=None, clip_tokenizer=None,
     cnt_step_base=0, step_budget=None,
-    gd_model=None,
 ):
     """GD 导航链：VLM 选定视角 → GD 检测 → 3D 反投影 → 迭代螺旋搜索导航。
 
@@ -1067,6 +1066,11 @@ def grounded_navigate_to_object(
     obs, cam_pose_habitat = scene.get_observation(pts, view_angle)
     rgb = obs["color_sensor"]
     depth = obs["depth_sensor"]
+    # If the caller passed the VLM-selected view's cam_pose, use it for
+    # back-projection — guarantees the pose matches the view the VLM saw
+    # (avoids any render drift between Stage 5 render and this render).
+    if view_cam_pose is not None:
+        cam_pose_habitat = view_cam_pose
 
     bbox, phrase, score, _ = _gd_detect(rgb, object_desc)
     if bbox is None:
