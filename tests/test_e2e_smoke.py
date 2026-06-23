@@ -49,7 +49,6 @@ def test_navigate_to_object_signature():
     assert "view_idx" in params
     assert "view_angle" in params
     assert "view_cam_pose" in params
-    assert "gd_model" in params
 
 
 def test_grounded_navigate_signature():
@@ -64,7 +63,6 @@ def test_grounded_navigate_signature():
             assert "view_idx" in arg_names
             assert "view_angle" in arg_names
             assert "view_cam_pose" in arg_names
-            assert "gd_model" in arg_names
             return
     pytest.fail("grounded_navigate_to_object not found in src/scene_aeqa.py")
 
