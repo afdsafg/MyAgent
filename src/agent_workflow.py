@@ -153,12 +153,13 @@ Stage transition guide:
 """
 
 # ── VLM Output Schema (shared across stages) ──
+# Note: braces are escaped ({{ }}) so .format() doesn't treat them as placeholders
 SCHEMA_REQUIREMENT = """
 你必须输出以下 JSON 格式（不要输出其他内容）：
-{
+{{
   "reason": "<一句话解释为什么做这个选择，必须包含你观察到的具体视觉线索>",
   ...action-specific fields...
-}
+}}
 
 reason 字段要求：
 - 必须包含你从图片中观察到的具体视觉线索（如"view3 中看到不锈钢家电"）
