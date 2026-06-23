@@ -182,8 +182,8 @@ def observe_panorama(
     from src.agent_image_utils import make_mosaic, numpy_to_base64
     import matplotlib.pyplot as plt
 
-    DIRECTIONS = ["前", "右前", "右", "右后", "后", "左后", "左", "左前"]
-    # 顺时针每 45°，view_idx 0 = agent 当前朝向 = "前"
+    DIRECTIONS = ["front", "front-right", "right", "back-right", "back", "back-left", "left", "front-left"]
+    # Clockwise every 45°, view_idx 0 = agent's current heading = "front"
     angles = [angle + i * 2 * np.pi / 8 for i in range(8)]
 
     panorama_views = []
@@ -253,10 +253,10 @@ def observe_panorama(
                     arrowprops=dict(arrowstyle='->', lw=2, color='black'))
                 ax.annotate('', xy=(cx+al, cy), xytext=(cx, cy),
                     arrowprops=dict(arrowstyle='->', lw=2, color='black'))
-                ax.text(cx, cy+al+0.05, '前', ha='center', fontsize=12, fontweight='bold')
-                ax.text(cx, cy-al-0.05, '后', ha='center', fontsize=12, fontweight='bold')
-                ax.text(cx-al-0.05, cy, '左', va='center', fontsize=12, fontweight='bold')
-                ax.text(cx+al+0.05, cy, '右', va='center', fontsize=12, fontweight='bold')
+                ax.text(cx, cy+al+0.05, 'Front', ha='center', fontsize=12, fontweight='bold')
+                ax.text(cx, cy-al-0.05, 'Back', ha='center', fontsize=12, fontweight='bold')
+                ax.text(cx-al-0.05, cy, 'Left', va='center', fontsize=12, fontweight='bold')
+                ax.text(cx+al+0.05, cy, 'Right', va='center', fontsize=12, fontweight='bold')
             else:
                 ax.imshow(views_rgb[idx])
                 ax.set_title(DIRECTIONS[idx], fontsize=11, fontweight='bold')
@@ -271,7 +271,7 @@ def observe_panorama(
     plt.close(fig)
 
     mosaic_b64 = numpy_to_base64(mosaic)
-    text = f"Panorama: 8 views (前/右前/右/右后/后/左后/左/左前) at step {cnt_step}"
+    text = f"Panorama: 8 views (front/front-right/right/back-right/back/back-left/left/front-left) at step {cnt_step}"
     return pts, angle, mosaic_b64, text, panorama_views
 
 

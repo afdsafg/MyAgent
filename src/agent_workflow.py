@@ -126,7 +126,7 @@ SYSTEM_PROMPT = """You are an embodied navigation agent searching for the answer
 You operate in a 6-stage workflow. In each stage you have specific goals and tools available.
 
 Available tools:
-- observe_panorama: Take a 7-view panorama. Returns a mosaic image showing all directions and room/frontier information.
+- observe_panorama: Take an 8-view panorama. Returns a mosaic image showing all directions and room/frontier information.
 - view_direction <direction>: Look toward "left", "right", "forward", or "backward". Returns the RGB image from that direction.
 - navigate_to_object <object_description>: Use GroundingDINO to detect the described object and navigate toward it. Returns success/failure and status. The <object_description> MUST be a concrete noun phrase that GroundingDINO can detect, e.g. "oven", "the red door", "towel hanging on oven handle", "coffee table". Do NOT use room names, directions, or abstract concepts — only physical objects.
 - navigate_to_seed <room_id>: Navigate toward the center of the specified room (e.g. "1").
@@ -155,16 +155,16 @@ Stage transition guide:
 # ── VLM Output Schema (shared across stages) ──
 # Note: braces are escaped ({{ }}) so .format() doesn't treat them as placeholders
 SCHEMA_REQUIREMENT = """
-你必须输出以下 JSON 格式（不要输出其他内容）：
+You MUST output the following JSON format (output nothing else):
 {{
-  "reason": "<一句话解释为什么做这个选择，必须包含你观察到的具体视觉线索>",
+  "reason": "<one sentence explaining your choice, must include specific visual clues you observed>",
   ...action-specific fields...
 }}
 
-reason 字段要求：
-- 必须包含你从图片中观察到的具体视觉线索（如"view3 中看到不锈钢家电"）
-- 必须解释该选择如何帮助回答问题
-- 不允许输出"我决定..."等空泛表述，必须有具体依据
+reason field requirements:
+- Must include specific visual clues you observed from the image (e.g. "I see a stainless steel appliance in view3")
+- Must explain how this choice helps answer the question
+- Vague statements like "I decided to..." are NOT allowed; you must provide concrete evidence
 """
 
 STAGE1_PROMPT = """Stage 1: Initial Exploration
@@ -178,7 +178,7 @@ Question: "{question}"
 STAGE2_PROMPT = """Stage 2: Main Direction Decision
 
 Look at the 8-view panorama above. The views are labeled:
-  view0=前 view1=右前 view2=右 view3=右后 view4=后 view5=左后 view6=左 view7=左前
+  view0=front view1=front-right view2=right view3=back-right view4=back view5=back-left view6=left view7=front-left
 
 For the question: "{question}"
 
