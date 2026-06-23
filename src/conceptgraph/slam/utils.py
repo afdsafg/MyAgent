@@ -1340,6 +1340,7 @@ def detections_to_obj_pcd_and_bbox(
     dbscan_eps=None,
     dbscan_min_points=None,
     run_dbscan=None,
+    camera_convention="opengl",
     device="cuda",
 ):
     """
@@ -1354,6 +1355,7 @@ def detections_to_obj_pcd_and_bbox(
         min_points_threshold (int, optional): Minimum number of points required for an object. Defaults to 5.
         spatial_sim_type (str, optional): Type of spatial similarity. Defaults to 'axis_aligned'.
         device (str, optional): Device to use. Defaults to 'cuda'.
+        camera_convention (str, optional): 'opengl' (z-back, z<0 valid) or 'z_forward' (z>0 valid). Defaults to 'opengl'.
 
     Returns:
         list: List of dictionaries containing processed objects. Each dictionary contains a point cloud and a bounding box.
@@ -1383,7 +1385,10 @@ def detections_to_obj_pcd_and_bbox(
         mask_points = points_tensor[i]
         mask_colors = colors_tensor[i] if colors_tensor is not None else None
 
-        valid_points_mask = mask_points[:, :, 2] < 0
+        if camera_convention == "z_forward":
+            valid_points_mask = mask_points[:, :, 2] > 0
+        else:  # opengl (default)
+            valid_points_mask = mask_points[:, :, 2] < 0
         if torch.sum(valid_points_mask) < min_points_threshold:
             continue
 
