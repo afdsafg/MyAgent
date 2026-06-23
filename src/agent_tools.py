@@ -101,12 +101,14 @@ def _navigate_to_target_with_agent_step(
     memory_store, cam_intr, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
+    seed_view_manager=None, active_seed_ids=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, int]:
     """循环调用 set_next_navigation_point + agent_step 直到抵达目标。
 
     决策节奏：VLM 调用此函数后不参与每子步决策，只在抵达后由调用方唤醒 VLM。
     每个子步后执行 silent_perception_step（plan §3：每 step 存档）。
     step_budget: 剩余底层步数配额，超出后停止导航。
+    seed_view_manager: optional SeedViewManager for lazy seed view updates.
     Returns: (final_pts, final_angle, arrived, status, substeps_taken)
     """
     # 确保上一次的导航状态被清空，避免 set_next 拒绝
@@ -147,6 +149,11 @@ def _navigate_to_target_with_agent_step(
             memory_store, cam_intr, cfg, detection_model, sam_predictor,
             clip_model, clip_preprocess, clip_tokenizer,
         )
+
+        # Update seed views if conditions met (lazy update)
+        if seed_view_manager is not None and active_seed_ids:
+            seed_view_manager.update_after_step(
+                active_seed_ids, cur_pts, tsdf_planner, scene)
 
         if target_arrived:
             arrived = True
@@ -353,6 +360,7 @@ def navigate_to_seed(
     memory_store, cam_intr, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
+    seed_view_manager=None, active_seed_ids=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """导航到指定房间种子点。返回 (pts, angle, success, status, img_b64)。
 
@@ -390,7 +398,10 @@ def navigate_to_seed(
         scene, tsdf_planner, cur_pts, cur_angle, temp_frontier, cfg,
         memory_store, cam_intr, detection_model, sam_predictor,
         clip_model, clip_preprocess, clip_tokenizer, cnt_step, max_substeps,
-        step_budget=step_budget)
+        step_budget=step_budget,
+        seed_view_manager=seed_view_manager,
+        active_seed_ids=active_seed_ids or [],
+    )
 
     # 抵达后更新 frontier / 房间分割
     if np.linalg.norm(final_pts - cur_pts) > 1e-3:
@@ -409,6 +420,7 @@ def navigate_to_frontier(
     memory_store, cam_intr, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
+    seed_view_manager=None, active_seed_ids=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """导航到指定 frontier。返回 (pts, angle, success, status, img_b64)。
 
@@ -430,7 +442,10 @@ def navigate_to_frontier(
         scene, tsdf_planner, cur_pts, cur_angle, frontier, cfg,
         memory_store, cam_intr, detection_model, sam_predictor,
         clip_model, clip_preprocess, clip_tokenizer, cnt_step, max_substeps,
-        step_budget=step_budget)
+        step_budget=step_budget,
+        seed_view_manager=seed_view_manager,
+        active_seed_ids=active_seed_ids or [],
+    )
 
     if np.linalg.norm(final_pts - cur_pts) > 1e-3:
         tsdf_planner.update_frontier_map(

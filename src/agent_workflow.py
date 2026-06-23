@@ -501,8 +501,12 @@ def run_episode(
                         memory_store, cam_intr, detection_model, sam_predictor,
                         clip_model, clip_preprocess, clip_tokenizer, total_steps,
                         step_budget=step_budget,
+                        seed_view_manager=seed_view_manager,
+                        active_seed_ids=[sid for sid in seed_view_manager.seeds],
                     )
                     total_steps += 1
+                    # Register any new seeds discovered after navigation
+                    _register_new_seeds(seed_view_manager, tsdf_planner, scene, pts)
                     current_stage = 5
                 else:
                     current_stage = 6
@@ -654,8 +658,12 @@ def run_episode(
                     memory_store, cam_intr, detection_model, sam_predictor,
                     clip_model, clip_preprocess, clip_tokenizer, total_steps,
                     step_budget=step_budget,
+                    seed_view_manager=seed_view_manager,
+                    active_seed_ids=[sid for sid in seed_view_manager.seeds],
                 )
                 total_steps += 1
+                # Register any new seeds discovered after navigation
+                _register_new_seeds(seed_view_manager, tsdf_planner, scene, pts)
                 current_stage = 5
 
         # ═══ Final Answer (Stage 6 fallback) ═══
@@ -691,6 +699,21 @@ def run_episode(
                 pass
 
     return result
+
+
+def _register_new_seeds(seed_view_manager, tsdf_planner, scene, agent_pts):
+    """Scan room_regions and register any new seeds not yet in SeedViewManager."""
+    if not hasattr(tsdf_planner, "room_regions") or not tsdf_planner.room_regions:
+        return
+    existing_ids = set(seed_view_manager.seeds.keys())
+    for room in tsdf_planner.room_regions:
+        if room.room_id not in existing_ids and room.room_state != "explored":
+            try:
+                seed_view_manager.register_seed(
+                    room.room_id, room.center.astype(np.float64),
+                    scene, tsdf_planner, agent_pts)
+            except Exception:
+                pass
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
