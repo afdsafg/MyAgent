@@ -1100,11 +1100,12 @@ def grounded_navigate_to_object(
             min_points_threshold=5,
             spatial_sim_type=cfg_cg.spatial_sim_type,
             obj_pcd_max_points=cfg_cg.obj_pcd_max_points,
-            downsample_voxel_size=cfg_cg.get('downsample_voxel_size',
-                cfg_cg.get('downsample_voxcel_size', 0.02))
-                if isinstance(cfg_cg, dict)
-                else getattr(cfg_cg, 'downsample_voxel_size',
-                    getattr(cfg_cg, 'downsample_voxcel_size', 0.02)),
+            downsample_voxel_size=getattr(cfg_cg, 'downsample_voxel_size',
+                getattr(cfg_cg, 'downsample_voxcel_size', 0.02)),
+            dbscan_remove_noise=getattr(cfg_cg, 'dbscan_remove_noise', False),
+            dbscan_eps=getattr(cfg_cg, 'dbscan_eps', 0.01),
+            dbscan_min_points=getattr(cfg_cg, 'dbscan_min_points', 3),
+            run_dbscan=getattr(cfg_cg, 'dbscan_remove_noise', False),
             device=device,
         )
     except Exception as e:
