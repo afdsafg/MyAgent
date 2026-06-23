@@ -100,18 +100,13 @@ def _navigate_to_target_with_agent_step(
     scene, tsdf_planner, pts, angle, choice, cfg,
     memory_store, cam_intr, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
-    max_substeps=25, step_budget=None, target_type=None,
-    update_planning_grids=False,
+    max_substeps=25, step_budget=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, int]:
     """循环调用 set_next_navigation_point + agent_step 直到抵达目标。
 
     决策节奏：VLM 调用此函数后不参与每子步决策，只在抵达后由调用方唤醒 VLM。
     每个子步后执行 silent_perception_step（plan §3：每 step 存档）。
     step_budget: 剩余底层步数配额，超出后停止导航。
-    target_type: 导航目标类型。None 使用默认（Frontier/SnapShot 分支），
-        "image" 表示 choice 是 habitat 3D 位置（np.ndarray）。
-    update_planning_grids: 每子步后刷新 planner grids + frontier map，
-        GD 螺旋搜索需要此选项以在迭代间扩展可导航区域。
     Returns: (final_pts, final_angle, arrived, status, substeps_taken)
     """
     # 确保上一次的导航状态被清空，避免 set_next 拒绝
@@ -121,7 +116,6 @@ def _navigate_to_target_with_agent_step(
     success = tsdf_planner.set_next_navigation_point(
         choice=choice, pts=pts, objects=scene.objects,
         cfg=cfg.planner, pathfinder=scene.pathfinder,
-        target_type=target_type,
     )
     if not success:
         return pts, angle, False, "Failed to set navigation target", 0
@@ -153,13 +147,6 @@ def _navigate_to_target_with_agent_step(
             memory_store, cam_intr, cfg, detection_model, sam_predictor,
             clip_model, clip_preprocess, clip_tokenizer,
         )
-
-        # GD 螺旋搜索需要每步刷新网格和 frontier 以扩展可导航区域
-        if update_planning_grids:
-            tsdf_planner.refresh_planner_grids(cur_pts)
-            tsdf_planner.update_frontier_map(
-                cur_pts, cfg.planner, scene, cnt_step + substeps,
-                save_frontier_image=False)
 
         if target_arrived:
             arrived = True

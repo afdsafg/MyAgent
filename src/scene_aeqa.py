@@ -1255,24 +1255,65 @@ def grounded_navigate_to_object(
             converged = True
             break
 
-        # 5. 导航到螺旋点 — 使用共享助手，每子步自动 silent_perception + 网格刷新
-        from src.agent_tools import _navigate_to_target_with_agent_step
-        nav_pts, nav_angle, arrived, nav_status, substeps = (
-            _navigate_to_target_with_agent_step(
-                scene, tsdf_planner, cur_pts, cur_angle, nav_habitat, cfg,
-                memory_store, cam_intr, detection_model, sam_predictor,
-                clip_model, clip_preprocess, clip_tokenizer,
-                cnt_step_base + iteration * max_nav_steps_per_iter,
-                max_substeps=max_nav_steps_per_iter,
-                target_type="image",
-                update_planning_grids=True,
+        # 5. 设置导航点 — 直接设置 max_point/target_point（不使用 set_next_navigation_point）
+        #    遵循 debug_iterative_spiral_navigate.py 的原始实现
+        from src.geom import get_nearest_true_point
+        from src.agent_tools import silent_perception_step as gd_silent_step
+
+        tsdf_planner.max_point = None
+        tsdf_planner.target_point = None
+        nav_voxel = tsdf_planner.habitat2voxel(nav_habitat)[:2]
+        tsdf_planner.max_point = nav_voxel.copy()
+        tsdf_planner.target_point = get_nearest_true_point(
+            nav_voxel, tsdf_planner.unoccupied)
+        if tsdf_planner.target_point is None:
+            logging.warning(
+                f"  GD iter {iteration}: get_nearest_true_point failed, "
+                f"teleporting to spiral point")
+            tsdf_planner.max_point = None
+            tsdf_planner.target_point = None
+            cur_pts = nav_habitat.copy()
+            continue
+
+        # 6. 每步导航：agent_step → silent_perception → refresh_grids → update_frontier_map
+        #    遵循 debug 脚本：即使到达但未收敛，继续下一迭代重新螺旋搜索
+        arrived = False
+        for nav_step in range(1, max_nav_steps_per_iter + 1):
+            result = tsdf_planner.agent_step(
+                pts=cur_pts, angle=cur_angle,
+                objects=scene.objects, snapshots=scene.snapshots,
+                pathfinder=scene.pathfinder, cfg=cfg.planner,
+                save_visualization=False,
             )
-        )
-        cur_pts, cur_angle = nav_pts, nav_angle
-        logging.info(
-            f"  GD iter {iteration}: nav result arrived={arrived} "
-            f"status={nav_status} substeps={substeps}"
-        )
+            if result[0] is None:
+                tsdf_planner.max_point = None
+                tsdf_planner.target_point = None
+                break
+            cur_pts, cur_angle, _, _, _, target_arrived = result
+
+            # 每子步静默感知（场景图更新 + TSDF 融合 + 快照存档）
+            gd_silent_step(
+                scene, tsdf_planner, cur_pts, cur_angle,
+                cnt_step_base + iteration * max_nav_steps_per_iter + nav_step,
+                memory_store, cam_intr, cfg_ext or cfg,
+                detection_model, sam_predictor,
+                clip_model, clip_preprocess, clip_tokenizer,
+            )
+
+            # 刷新网格（island 扩大）并更新 frontier/房间分割
+            tsdf_planner.refresh_planner_grids(cur_pts)
+            tsdf_planner.update_frontier_map(
+                cur_pts, cfg.planner, scene,
+                cnt_step_base + iteration * max_nav_steps_per_iter + nav_step,
+                save_frontier_image=False)
+
+            if target_arrived:
+                arrived = True
+                break
+
+        # 清理导航状态
+        tsdf_planner.max_point = None
+        tsdf_planner.target_point = None
 
         if arrived:
             arrived_any = True
