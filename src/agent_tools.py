@@ -264,20 +264,21 @@ def view_direction(
 
 
 def navigate_to_object(
-    scene, tsdf_planner, pts, angle, object_desc,
+    scene, tsdf_planner, pts, angle,
+    view_idx, view_angle, view_cam_pose, object_desc,
     memory_store, cam_intr, cfg, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
-    max_steps=20, step_budget=None,
+    max_steps=20, step_budget=None, gd_model=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """GD 导航到指定物体。返回 (pts, angle, success, status, img_b64)。
 
-    GD 导航内部：检测→迭代螺旋搜索导航。VLM 不参与每子步决策，只在完成后被唤醒。
+    视角由 VLM 选定（view_idx + view_angle + view_cam_pose）。
+    GD 检测使用该视角，不做方向扫描。
     step_budget 用于限制导航步数，避免超出总步数配额。
     """
     from src.scene_aeqa import grounded_navigate_to_object as gd_nav
     from src.agent_image_utils import numpy_to_base64
 
-    # 用剩余配额限制导航步数
     max_nav = 15
     max_iter = 5
     if step_budget is not None:
@@ -285,7 +286,9 @@ def navigate_to_object(
         max_iter = min(max_iter, max(1, step_budget // 3))
 
     new_pts, new_angle, success, status, _images = gd_nav(
-        scene, tsdf_planner, pts, angle, object_desc,
+        scene, tsdf_planner, pts, angle,
+        view_idx=view_idx, view_angle=view_angle, view_cam_pose=view_cam_pose,
+        object_desc=object_desc,
         max_consecutive_failures=5,
         max_iterations=max_iter, converge_dist_voxels=5,
         max_nav_steps_per_iter=max_nav,
@@ -294,14 +297,11 @@ def navigate_to_object(
         clip_model=clip_model, clip_preprocess=clip_preprocess,
         clip_tokenizer=clip_tokenizer,
         cnt_step_base=cnt_step, step_budget=step_budget,
+        gd_model=gd_model,
     )
 
-    # GD 导航内部通过 _navigate_to_target_with_agent_step 已做每子步 silent_perception
-    # 这里只更新 frontier map 并返回当前视角图像给 VLM
-    tsdf_planner.update_frontier_map(
-        new_pts, cfg.planner, scene, cnt_step, save_frontier_image=False)
-
-    # 返回当前视角图像给 VLM
+    # GD 导航内部每子步已做 silent_perception + refresh + update_frontier
+    # 这里只返回当前视角图像给 VLM
     obs, _ = scene.get_observation(new_pts, new_angle)
     img_b64 = numpy_to_base64(obs["color_sensor"][..., :3])
 
