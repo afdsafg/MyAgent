@@ -354,7 +354,7 @@ def run_episode(
         logger.info("--- Stage 1: Initial Panorama ---")
         context.start_stage(1)
 
-        pts, angle, mosaic_b64, pano_text = observe_panorama(
+        pts, angle, mosaic_b64, pano_text, panorama_views = observe_panorama(
             scene, tsdf_planner, pts, angle, total_steps,
             memory_store, cam_intr, cfg, detection_model,
             sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
@@ -472,7 +472,7 @@ def run_episode(
                 obs_image = None
 
                 if tool == "observe_panorama":
-                    pts, angle, obs_image, obs_text = observe_panorama(
+                    pts, angle, obs_image, obs_text, _pano_views = observe_panorama(
                         scene, tsdf_planner, pts, angle, total_steps,
                         memory_store, cam_intr, cfg, detection_model,
                         sam_predictor, clip_model, clip_preprocess, clip_tokenizer,

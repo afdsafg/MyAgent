@@ -166,20 +166,34 @@ def observe_panorama(
     scene, tsdf_planner, pts, angle, cnt_step,
     memory_store, cam_intr, cfg, detection_model,
     sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-) -> Tuple[np.ndarray, np.ndarray, str, str]:
-    """7 视角全景观测，返回 (pts, angle, mosaic_b64, text)。
+) -> Tuple[np.ndarray, np.ndarray, str, str, list]:
+    """8 视角全景观测，返回 (pts, angle, mosaic_b64, text, panorama_views)。
 
-    7 个视角均匀覆盖 360°（endpoint=False 避免首尾重叠）。
+    8 视角：前/右前/右/右后/后/左后/左/左前（相对 agent 朝向，顺时针每 45°）
+    拼图布局：3×3 网格，中心是方位指南针
     """
     from src.agent_image_utils import make_mosaic, numpy_to_base64
+    import matplotlib.pyplot as plt
 
-    angles = np.linspace(-np.pi, np.pi, 7, endpoint=False)
-    views = []
-    for ang in angles:
-        obs, _ = scene.get_observation(pts, ang)
-        views.append(obs["color_sensor"][..., :3])
+    DIRECTIONS = ["前", "右前", "右", "右后", "后", "左后", "左", "左前"]
+    # 顺时针每 45°，view_idx 0 = agent 当前朝向 = "前"
+    angles = [angle + i * 2 * np.pi / 8 for i in range(8)]
 
-    # 静默执行感知（3视角 + TSDF + 场景图更新；snapshot 由下方 7 视角存档）
+    panorama_views = []
+    views_rgb = []
+    for i, ang in enumerate(angles):
+        obs, cam_pose = scene.get_observation(pts, ang)
+        rgb = obs["color_sensor"][..., :3]
+        views_rgb.append(rgb)
+        panorama_views.append({
+            "view_idx": i,
+            "direction": DIRECTIONS[i],
+            "angle": float(ang),
+            "cam_pose": cam_pose,
+            "rgb": rgb,
+        })
+
+    # 静默执行感知（3视角 + TSDF + 场景图更新；snapshot 由下方 8 视角存档）
     silent_perception_step(
         scene, tsdf_planner, pts, angle, cnt_step, memory_store,
         cam_intr, cfg, detection_model, sam_predictor,
@@ -187,11 +201,11 @@ def observe_panorama(
         skip_snapshots=True,
     )
 
-    # 保存全景 7 张视角到 MemoryStore
+    # 保存全景 8 张视角到 MemoryStore
     room_id = tsdf_planner.get_room_id_at(
         tsdf_planner.habitat2voxel(pts)[:2])
     step_id = silent_perception_step._step_counter
-    for ang_idx, view_rgb in enumerate(views):
+    for ang_idx, view_rgb in enumerate(views_rgb):
         objs_in_view = [
             scene.objects[oid]["class_name"]
             for oid in scene.objects
@@ -200,7 +214,7 @@ def observe_panorama(
             ) < cfg.scene_graph.obj_include_dist + 0.5
         ]
         memory_store.add_snapshot(
-            snapshot_id=f"step{step_id}_pano_view{ang_idx}",
+            snapshot_id=f"pano_step{step_id}_view{ang_idx}",
             image=view_rgb,
             room_id=room_id,
             objects_in_view=objs_in_view,
@@ -210,22 +224,47 @@ def observe_panorama(
             clip_tokenizer=clip_tokenizer,
         )
 
-    # 更新 frontier / 房间分割
-    tsdf_planner.update_frontier_map(
-        pts, cfg.planner, scene, cnt_step, save_frontier_image=False)
+    # 构建 3×3 拼图（中心是方位指南针）
+    fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+    ax_ord = np.array([[7, 0, 1], [6, -1, 2], [5, 4, 3]])
+    for row in range(3):
+        for col in range(3):
+            idx = ax_ord[row, col]
+            ax = axes[row, col]
+            if idx == -1:
+                # 中心格：方位指南针
+                ax.axis('off')
+                ax.set_xlim(0, 1)
+                ax.set_ylim(0, 1)
+                cx, cy = 0.5, 0.5
+                al = 0.25
+                ax.annotate('', xy=(cx, cy+al), xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+                ax.annotate('', xy=(cx, cy-al), xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+                ax.annotate('', xy=(cx-al, cy), xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+                ax.annotate('', xy=(cx+al, cy), xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+                ax.text(cx, cy+al+0.05, '前', ha='center', fontsize=12, fontweight='bold')
+                ax.text(cx, cy-al-0.05, '后', ha='center', fontsize=12, fontweight='bold')
+                ax.text(cx-al-0.05, cy, '左', va='center', fontsize=12, fontweight='bold')
+                ax.text(cx+al+0.05, cy, '右', va='center', fontsize=12, fontweight='bold')
+            else:
+                ax.imshow(views_rgb[idx])
+                ax.set_title(DIRECTIONS[idx], fontsize=11, fontweight='bold')
+                ax.axis('off')
 
-    mosaic = make_mosaic(views, target_h=200)
+    fig.tight_layout()
+    # Rasterize to numpy
+    fig.canvas.draw()
+    mosaic = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    mosaic = mosaic.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    plt.close(fig)
+
     mosaic_b64 = numpy_to_base64(mosaic)
-
-    room_info = ""
-    if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
-        room_info = f"\nRooms detected: {len(tsdf_planner.room_regions)}"
-
-    text = (
-        f"Panorama observed. {len(tsdf_planner.frontiers)} frontiers available."
-        f"{room_info}"
-    )
-    return pts, angle, mosaic_b64, text
+    text = f"Panorama: 8 views (前/右前/右/右后/后/左后/左/左前) at step {cnt_step}"
+    return pts, angle, mosaic_b64, text, panorama_views
 
 
 def view_direction(
