@@ -151,79 +151,116 @@ Stage transition guide:
 - Stage 6: call submit_answer.
 """
 
-STAGE1_PROMPT = """Stage 1: Initial Exploration
+# ── VLM Output Schema (shared across stages) ──
+SCHEMA_REQUIREMENT = """
+你必须输出以下 JSON 格式（不要输出其他内容）：
+{
+  "reason": "<一句话解释为什么做这个选择，必须包含你观察到的具体视觉线索>",
+  ...action-specific fields...
+}
 
-You are at the starting position. First, call observe_panorama to look around and understand your surroundings. Based on the panorama, identify:
-1. What rooms you can see
-2. What objects are visible
-3. What unexplored areas (frontiers) exist
-
-Describe what you see and which direction you think is most promising for finding the answer to: "{question}"
+reason 字段要求：
+- 必须包含你从图片中观察到的具体视觉线索（如"view3 中看到不锈钢家电"）
+- 必须解释该选择如何帮助回答问题
+- 不允许输出"我决定..."等空泛表述，必须有具体依据
 """
 
-STAGE2_PROMPT = """Stage 2: Direction Judgment
+STAGE1_PROMPT = """Stage 1: Initial Exploration
 
-Based on the panorama you just observed, look at the objects and rooms visible. 
+You are at the starting position. Call observe_panorama to look around.
+Based on the panorama, describe what you see and which direction is most promising.
+
+Question: "{question}"
+"""
+
+STAGE2_PROMPT = """Stage 2: Main Direction Decision
+
+Look at the 8-view panorama above. The views are labeled:
+  view0=前 view1=右前 view2=右 view3=右后 view4=后 view5=左后 view6=左 view7=左前
 
 For the question: "{question}"
 
-Do you see the target objects or relevant clues in the current view?
-- If YES: Call navigate_to_object with a SPECIFIC physical object name (e.g. "oven", "the red door", "towel"). The argument must be a concrete noun phrase a detector can find — NOT a room name, direction, or abstract concept.
-- If NO: Call navigate_to_frontier or navigate_to_seed to explore unexplored areas.
+Decide:
+- If you see a relevant object in one of the views -> navigate_to_object with view_idx
+- If no relevant object visible in any view -> explore_other_room
 
-Available rooms: {rooms_info}
-Available frontiers: {frontiers_info}
+{SCHEMA_REQUIREMENT}
+
+Actions:
+1. navigate_to_object: {{"reason": "...", "action": "navigate_to_object", "view_idx": <0-7>}}
+2. explore_other_room: {{"reason": "...", "action": "explore_other_room"}}
 """
 
-STAGE3_PROMPT = """Stage 3: Targeted Navigation
+STAGE2_5A_PROMPT = """Stage 2.5a: Seed Selection
 
-You are looking for objects relevant to: "{question}"
+You decided to explore other rooms. Here are the available unexplored seeds
+(each image shows the view from your current position toward that seed):
 
-Based on what you observed in the panorama, identify the specific physical object that is most likely to help answer the question. Then call navigate_to_object with a concrete noun phrase describing that object.
+{seed_info}
 
-IMPORTANT: The argument to navigate_to_object must be a specific physical object name that a detector can find in an image. Examples:
-- GOOD: "oven", "the red door", "towel", "coffee table", "kitchen counter"
-- BAD: "forward", "room 1", "the kitchen", "explore", "left side"
+For the question: "{question}"
 
-If you cannot identify a specific object to navigate to, use view_direction to look around, or navigate_to_frontier / navigate_to_seed to explore other areas.
+Decide:
+- If a seed seems relevant -> explore_seed with seed_id
+- If all seeds seem irrelevant -> explore_frontier (fallback)
 
-Available rooms: {rooms_info}
-Available frontiers: {frontiers_info}
+{SCHEMA_REQUIREMENT}
+
+Actions:
+1. explore_seed: {{"reason": "...", "action": "explore_seed", "seed_id": <id>}}
+2. explore_frontier: {{"reason": "...", "action": "explore_frontier"}}
 """
 
-STAGE4_PROMPT = """Stage 4: Final Exploration
+STAGE3_PROMPT = """Stage 3: Object Selection
 
-You've explored several areas but haven't found the answer yet. 
+You selected view_idx {view_idx}. Here is the large image of that view.
 
-Question: "{question}"
+For the question: "{question}"
 
-Choose which room or frontier to explore next. Consider:
-- Which rooms have you not fully explored?
-- Which frontiers seem most promising?
+You MUST output ONE concrete physical object name visible in this image that
+will serve as your navigation anchor. The object must be:
+- A concrete noun phrase a detector can find (e.g. "oven", "the red door", "towel")
+- NOT a room name, direction, or abstract concept
 
-Available rooms: {rooms_info}
-Available frontiers: {frontiers_info}
+{SCHEMA_REQUIREMENT}
+
+Output: {{"reason": "...", "object": "<object_name>"}}
 """
 
-STAGE5_PROMPT = """Stage 5: Memory Fallback
+STAGE5_PROMPT = """Stage 5: Re-decision After Arrival
 
-You've explored extensively but still need to answer: "{question}"
+You've arrived near the target. Here are the 3 frontal views from your
+current position (left 60°, front, right 60°):
+  view0=left view1=front view2=right
 
-You can use query_memory to search past observations. You have a limited number of queries remaining.
-The query result will be shown to you as an image on the next turn.
+For the question: "{question}"
 
-If you think you have enough information, use submit_answer to provide your answer.
-If you truly cannot find the answer, submit "unanswerable".
-When ready to answer, set next_stage to 6.
+Decide:
+- If you can answer the question now -> submit_answer
+- If you see a new relevant object in one of the 3 views -> navigate_to_object
+- If you need to explore other rooms -> explore_other_room
+
+{SCHEMA_REQUIREMENT}
+
+Actions:
+1. navigate_to_object: {{"reason": "...", "action": "navigate_to_object", "view_idx": <0-2>}}
+2. explore_other_room: {{"reason": "...", "action": "explore_other_room"}}
+3. submit_answer: {{"reason": "...", "action": "submit_answer", "answer": "<your_answer>"}}
 """
 
-STAGE6_PROMPT = """Stage 6: Submit Answer
+STAGE6_PROMPT = """Stage 6: Frontier Selection
 
-Based on all observations and reasoning, submit your final answer.
+You decided to explore frontiers. Here are all available frontiers:
 
-Question: "{question}"
+{frontier_info}
 
-Respond with submit_answer and your answer.
+For the question: "{question}"
+
+Select the most promising frontier to explore next.
+
+{SCHEMA_REQUIREMENT}
+
+Output: {{"reason": "...", "frontier_id": <id>}}
 """
 
 
