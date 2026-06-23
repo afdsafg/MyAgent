@@ -1222,7 +1222,7 @@ def grounded_navigate_to_object(
             target_type="image",
             choice=pathfinder_target,
             pts=cur_pts.tolist(),
-            objects=None, obs_points=None,
+            objects=None,
             cfg=cfg.planner, pathfinder=scene.pathfinder,
             random_position=False, observe_snapshot=False,
         )
