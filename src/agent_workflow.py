@@ -30,6 +30,7 @@ from src.agent_tools import (
     submit_answer,
 )
 from src.agent_image_utils import numpy_to_base64, make_mosaic
+from src.seed_views import SeedViewManager
 
 logger = logging.getLogger(__name__)
 
@@ -387,10 +388,8 @@ def run_episode(
     stages_completed = 0
 
     try:
-        # ═══════ STAGE 1: Initial Panorama ═══════
+        # ═══ STAGE 1: 8-View Panorama ═══
         logger.info("--- Stage 1: Initial Panorama ---")
-        context.start_stage(1)
-
         pts, angle, mosaic_b64, pano_text, panorama_views = observe_panorama(
             scene, tsdf_planner, pts, angle, total_steps,
             memory_store, cam_intr, cfg, detection_model,
@@ -398,226 +397,283 @@ def run_episode(
         )
         total_steps += 1
 
-        # Build rooms/frontiers info string
-        rooms_info = _format_rooms_info(tsdf_planner)
-        frontiers_info = _format_frontiers_info(tsdf_planner)
+        # SeedViewManager: register seeds from current frontier/room map
+        seed_view_manager = SeedViewManager()
+        if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
+            for room in tsdf_planner.room_regions:
+                if room.room_state != "explored":
+                    try:
+                        seed_view_manager.register_seed(
+                            room.room_id, room.center.astype(np.float64),
+                            scene, tsdf_planner, pts)
+                    except Exception:
+                        pass
 
-        s1_msg = STAGE1_PROMPT.format(question=question)
-        context.add_message("system", SYSTEM_PROMPT)
-        context.add_message("user", pano_text + "\n" + s1_msg)
-        context.add_image(mosaic_b64)
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": pano_text + "\n" + s1_msg},
-        ]
-        vlm_response = call_vlm(messages, image_b64=mosaic_b64)
-        vlm_parsed = _parse_vlm_response(vlm_response)
-        context.add_message("assistant", vlm_response)
-        stages_completed = 1
-        logger.info(f"Stage 1 VLM: {vlm_parsed}")
-
-        # Determine next stage from VLM (default 2)
-        current_stage = int(vlm_parsed.get("next_stage", 2) or 2)
-        context.transition(current_stage, vlm_parsed.get("reasoning", "Stage 1 done"))
-
-        # ═══════ STAGE 2-5: Exploration Loop (non-linear) ═══════
-        # 决策节奏：VLM 只在导航抵达目标后才被唤醒做下一次决策（类似 choose_every_step=false）。
-        # 导航工具内部循环 agent_step 直到抵达，每子步做 silent_perception。
-        # max_total_steps 限制的是底层步数（silent_perception 次数），不是 VLM 决策次数。
-        stage_visit_count = {}
-        max_stage_visits = {2: 3, 3: 6, 4: 4, 5: 2}
-        max_stage_decisions = 8  # 每阶段最多 VLM 决策次数
+        # ═══ STAGE 2-6: 6-Stage State Machine ═══
+        current_stage = 2
+        consecutive_missing_reason = 0
+        max_vlm_calls = max_total_steps // 2
 
         def _low_level_steps():
             return silent_perception_step._step_counter
 
-        while current_stage in (2, 3, 4, 5) and _low_level_steps() < max_total_steps:
-            stage_visit_count[current_stage] = stage_visit_count.get(current_stage, 0) + 1
-            if stage_visit_count[current_stage] > max_stage_visits.get(current_stage, 3):
-                logger.info(f"Stage {current_stage} visited too many times, forcing advance")
-                current_stage = min(current_stage + 1, 5)
-                continue
+        vlm_call_count = 0
 
-            logger.info(f"--- Stage {current_stage} (visit {stage_visit_count[current_stage]}) ---")
-            context.start_stage(current_stage)
-
-            # Build stage prompt
+        while current_stage != "done" and _low_level_steps() < max_total_steps:
             if current_stage == 2:
-                stage_prompt = STAGE2_PROMPT.format(
-                    question=question, rooms_info=rooms_info,
-                    frontiers_info=frontiers_info)
-            elif current_stage == 3:
-                stage_prompt = STAGE3_PROMPT.format(
-                    question=question, rooms_info=rooms_info,
-                    frontiers_info=frontiers_info)
-            elif current_stage == 4:
-                stage_prompt = STAGE4_PROMPT.format(
-                    question=question, rooms_info=rooms_info,
-                    frontiers_info=frontiers_info)
-            else:  # stage 5
-                stage_prompt = STAGE5_PROMPT.format(question=question)
-
-            context.add_message("user", stage_prompt)
-
-            stage_decisions = 0
-            next_stage = None
-
-            while stage_decisions < max_stage_decisions and _low_level_steps() < max_total_steps:
-                messages = _build_messages(context)
-                last_img = context.stage_images[-1] if context.stage_images else None
-                vlm_response = call_vlm(messages, image_b64=last_img)
-                context.add_message("assistant", vlm_response)
-
-                stage_decisions += 1
-                total_steps += 1  # VLM-turn counter (for naming/logging only)
-
+                # ── Stage 2: Main Direction Decision (VLM call 1) ──
+                logger.info("--- Stage 2: Main Direction Decision ---")
+                stage_prompt = STAGE2_PROMPT.format(question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": pano_text + "\n" + stage_prompt},
+                ]
+                vlm_response = call_vlm(messages, image_b64=mosaic_b64)
+                vlm_call_count += 1
                 vlm_parsed = _parse_vlm_response(vlm_response)
-                tool = vlm_parsed.get("tool", "")
-                args = vlm_parsed.get("arguments", "")
-                reasoning = vlm_parsed.get("reasoning", "")
 
-                logger.info(f"Stage {current_stage} decision {stage_decisions} (low-level steps={_low_level_steps()}): tool={tool}, args={args}")
-
-                # Validate navigate_to_object has a concrete object description
-                if tool == "navigate_to_object":
-                    if not _is_valid_object_desc(args):
-                        logger.warning(f"Invalid object description for navigate_to_object: '{args}'")
-                        context.add_message("user",
-                            f"ERROR: navigate_to_object requires a concrete physical object name "
-                            f"(e.g. 'oven', 'the red door', 'towel'). "
-                            f"You provided: '{args}'. "
-                            f"Please call navigate_to_object again with a specific object name, "
-                            f"or use a different tool (view_direction, navigate_to_frontier, navigate_to_seed).")
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 2: 2x missing_reason, fallback to explore_other_room")
+                        current_stage = "2.5a"
+                        consecutive_missing_reason = 0
                         continue
+                    continue
 
-                # Check for answer submission
+                consecutive_missing_reason = 0
+                logger.info(f"Stage 2 VLM: {vlm_parsed}")
+
+                if vlm_parsed.get("tool") == "navigate_to_object":
+                    view_idx = int(vlm_parsed.get("view_idx", 0))
+                    view_idx = max(0, min(view_idx, len(panorama_views) - 1))
+                    view_info = panorama_views[view_idx]
+                    # Store view info for Stage 3
+                    pending_view = {
+                        "view_idx": view_idx,
+                        "angle": view_info["angle"],
+                        "cam_pose": view_info["cam_pose"],
+                    }
+                    current_stage = 3
+                else:
+                    current_stage = "2.5a"
+
+            elif current_stage == "2.5a":
+                # ── Stage 2.5a: Seed Selection (VLM call 2) ──
+                logger.info("--- Stage 2.5a: Seed Selection ---")
+                explored_seed_ids = set()
+                seed_ids = seed_view_manager.get_unexplored_seed_ids(explored_seed_ids)
+
+                if not seed_ids:
+                    logger.info("Stage 2.5a: no seeds available, fallback to frontier")
+                    current_stage = 6
+                    continue
+
+                seed_mosaic = seed_view_manager.get_mosaic(question)
+                seed_info = f"Available seeds: {seed_ids}"
+                stage_prompt = STAGE2_5A_PROMPT.format(
+                    seed_info=seed_info, question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": stage_prompt},
+                ]
+                vlm_response = call_vlm(messages, image_b64=seed_mosaic)
+                vlm_call_count += 1
+                vlm_parsed = _parse_vlm_response(vlm_response)
+
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 2.5a: 2x missing_reason, fallback to frontier")
+                        current_stage = 6
+                        consecutive_missing_reason = 0
+                        continue
+                    continue
+
+                consecutive_missing_reason = 0
+                logger.info(f"Stage 2.5a VLM: {vlm_parsed}")
+
+                if vlm_parsed.get("tool") == "explore_seed":
+                    seed_id = int(vlm_parsed.get("seed_id", seed_ids[0]))
+                    step_budget = max_total_steps - _low_level_steps()
+                    pts, angle, success, status, obs_image = navigate_to_seed(
+                        scene, tsdf_planner, pts, angle, seed_id, cfg,
+                        memory_store, cam_intr, detection_model, sam_predictor,
+                        clip_model, clip_preprocess, clip_tokenizer, total_steps,
+                        step_budget=step_budget,
+                    )
+                    total_steps += 1
+                    current_stage = 5
+                else:
+                    current_stage = 6
+
+            elif current_stage == 3:
+                # ── Stage 3: Object Selection (VLM call 3) ──
+                logger.info("--- Stage 3: Object Selection ---")
+                view_info = panorama_views[pending_view["view_idx"]]
+                rgb = view_info["rgb"]
+                stage_prompt = STAGE3_PROMPT.format(
+                    view_idx=pending_view["view_idx"], question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": stage_prompt},
+                ]
+                vlm_response = call_vlm(messages, image_b64=numpy_to_base64(rgb))
+                vlm_call_count += 1
+                vlm_parsed = _parse_vlm_response(vlm_response)
+
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 3: 2x missing_reason, fallback to explore_other_room")
+                        current_stage = "2.5a"
+                        consecutive_missing_reason = 0
+                        continue
+                    continue
+
+                consecutive_missing_reason = 0
+                object_desc = vlm_parsed.get("object", "")
+
+                if not _is_valid_object_desc(object_desc):
+                    logger.warning(f"Stage 3: invalid object '{object_desc}', retrying")
+                    continue
+
+                logger.info(f"Stage 3: object='{object_desc}'")
+
+                # ── Stage 4: GD Navigation (code, no VLM) ──
+                step_budget = max_total_steps - _low_level_steps()
+                pts, angle, success, status, _ = navigate_to_object(
+                    scene, tsdf_planner, pts, angle,
+                    view_idx=pending_view["view_idx"],
+                    view_angle=pending_view["angle"],
+                    view_cam_pose=pending_view["cam_pose"],
+                    object_desc=object_desc,
+                    memory_store=memory_store, cam_intr=cam_intr, cfg=cfg,
+                    detection_model=detection_model, sam_predictor=sam_predictor,
+                    clip_model=clip_model, clip_preprocess=clip_preprocess,
+                    clip_tokenizer=clip_tokenizer, cnt_step=total_steps,
+                    step_budget=step_budget, gd_model=detection_model,
+                )
+                total_steps += 1
+                current_stage = 5
+
+            elif current_stage == 5:
+                # ── Stage 5: Re-decision After Arrival (VLM call 4) ──
+                logger.info("--- Stage 5: Re-decision After Arrival ---")
+                # Render 3 frontal views (left 60°, front, right 60°)
+                obs_angles = [angle - np.pi / 3, angle, angle + np.pi / 3]
+                frontal_views = []
+                for ang in obs_angles:
+                    obs, _ = scene.get_observation(pts, ang)
+                    frontal_views.append(obs["color_sensor"][..., :3])
+
+                # Build 3-view mosaic
+                mosaic_3 = make_mosaic(frontal_views, target_h=300)
+
+                stage_prompt = STAGE5_PROMPT.format(question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": stage_prompt},
+                ]
+                vlm_response = call_vlm(messages, image_b64=mosaic_3)
+                vlm_call_count += 1
+                vlm_parsed = _parse_vlm_response(vlm_response)
+
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 5: 2x missing_reason, fallback to submit_answer")
+                        answer = vlm_parsed.get("answer", "unanswerable")
+                        result["answer"] = answer
+                        result["success"] = True
+                        result["steps_taken"] = _low_level_steps()
+                        result["stages_completed"] = 5
+                        current_stage = "done"
+                        break
+                    continue
+
+                consecutive_missing_reason = 0
+                logger.info(f"Stage 5 VLM: {vlm_parsed}")
+
+                tool = vlm_parsed.get("tool", "")
                 if tool == "submit_answer":
-                    answer = vlm_parsed.get("answer", args)
-                    logger.info(f"Answer submitted in stage {current_stage}: {answer}")
+                    answer = vlm_parsed.get("answer", "unanswerable")
                     result["answer"] = answer
                     result["success"] = True
                     result["steps_taken"] = _low_level_steps()
-                    result["stages_completed"] = current_stage
-                    return result
-
-                # Step budget for navigation tools — prevents overshooting max_total_steps
-                step_budget = max_total_steps - _low_level_steps()
-
-                # Execute tool — navigation tools run to arrival internally, VLM wakes after
-                obs_text = ""
-                obs_image = None
-
-                if tool == "observe_panorama":
-                    pts, angle, obs_image, obs_text, _pano_views = observe_panorama(
-                        scene, tsdf_planner, pts, angle, total_steps,
-                        memory_store, cam_intr, cfg, detection_model,
-                        sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-                    )
-                    rooms_info = _format_rooms_info(tsdf_planner)
-                    frontiers_info = _format_frontiers_info(tsdf_planner)
-                    obs_text += f"\n{rooms_info}\n{frontiers_info}"
-
-                elif tool == "view_direction":
-                    pts, angle, obs_image = view_direction(
-                        scene, tsdf_planner, pts, angle, args,
-                        memory_store, cam_intr, cfg, detection_model,
-                        sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-                        total_steps,
-                    )
-                    obs_text = f"Viewed direction: {args}"
-
+                    result["stages_completed"] = 5
+                    current_stage = "done"
                 elif tool == "navigate_to_object":
-                    pts, angle, success, status, obs_image = navigate_to_object(
-                        scene, tsdf_planner, pts, angle, args,
-                        memory_store, cam_intr, cfg, detection_model,
-                        sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-                        total_steps, step_budget=step_budget,
-                    )
-                    obs_text = f"navigate_to_object: success={success}, status={status}"
-                    rooms_info = _format_rooms_info(tsdf_planner)
-                    frontiers_info = _format_frontiers_info(tsdf_planner)
-                    obs_text += f"\n{rooms_info}\n{frontiers_info}"
-
-                elif tool == "navigate_to_seed":
-                    try:
-                        room_id = int(args)
-                    except (ValueError, TypeError):
-                        room_id = 0
-                    pts, angle, success, status, obs_image = navigate_to_seed(
-                        scene, tsdf_planner, pts, angle, room_id, cfg,
-                        memory_store, cam_intr, detection_model, sam_predictor,
-                        clip_model, clip_preprocess, clip_tokenizer, total_steps,
-                        step_budget=step_budget,
-                    )
-                    obs_text = f"navigate_to_seed: success={success}, status={status}"
-                    rooms_info = _format_rooms_info(tsdf_planner)
-                    frontiers_info = _format_frontiers_info(tsdf_planner)
-                    obs_text += f"\n{rooms_info}\n{frontiers_info}"
-
-                elif tool == "navigate_to_frontier":
-                    try:
-                        frontier_id = int(args)
-                    except (ValueError, TypeError):
-                        frontier_id = 0
-                    pts, angle, success, status, obs_image = navigate_to_frontier(
-                        scene, tsdf_planner, pts, angle, frontier_id, cfg,
-                        memory_store, cam_intr, detection_model, sam_predictor,
-                        clip_model, clip_preprocess, clip_tokenizer, total_steps,
-                        step_budget=step_budget,
-                    )
-                    obs_text = f"navigate_to_frontier: success={success}, status={status}"
-                    rooms_info = _format_rooms_info(tsdf_planner)
-                    frontiers_info = _format_frontiers_info(tsdf_planner)
-                    obs_text += f"\n{rooms_info}\n{frontiers_info}"
-
-                elif tool == "query_memory":
-                    obs_image = query_memory(memory_store, args)
-                    obs_text = f"Memory query for: {args}" if obs_image else "Memory query returned no results or quota exhausted"
-
+                    view_idx = int(vlm_parsed.get("view_idx", 1))
+                    view_idx = max(0, min(view_idx, 2))
+                    view_info = panorama_views[view_idx] if view_idx < len(panorama_views) else panorama_views[0]
+                    pending_view = {
+                        "view_idx": view_idx,
+                        "angle": view_info["angle"],
+                        "cam_pose": view_info["cam_pose"],
+                    }
+                    current_stage = 3
+                elif tool == "explore_other_room":
+                    current_stage = "2.5a"
                 else:
-                    obs_text = f"Tool '{tool}' not recognized."
+                    # Unknown action -> fallback to explore_other_room
+                    current_stage = "2.5a"
 
-                # Provide observation back to VLM (VLM wakes up here after navigation arrival)
-                context.add_message("user", f"Observation: {obs_text}")
-                if obs_image:
-                    context.add_image(obs_image)
+            elif current_stage == 6:
+                # ── Stage 6: Frontier Selection (VLM call 5) ──
+                logger.info("--- Stage 6: Frontier Selection ---")
+                frontier_info = _format_frontiers_info(tsdf_planner)
+                stage_prompt = STAGE6_PROMPT.format(
+                    frontier_info=frontier_info, question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": stage_prompt},
+                ]
+                # Use frontier visualization if available
+                frontier_img = None
+                if hasattr(tsdf_planner, '_last_frontier_image') and tsdf_planner._last_frontier_image is not None:
+                    frontier_img = numpy_to_base64(tsdf_planner._last_frontier_image)
 
-                # Check explicit next_stage transition from VLM
-                ns = vlm_parsed.get("next_stage")
-                if ns is not None:
-                    try:
-                        next_stage = int(ns)
-                    except (ValueError, TypeError):
-                        next_stage = None
-                    if next_stage in (1, 2, 3, 4, 5, 6) and next_stage != current_stage:
-                        break
+                vlm_response = call_vlm(messages, image_b64=frontier_img)
+                vlm_call_count += 1
+                vlm_parsed = _parse_vlm_response(vlm_response)
 
-            # Stage transition summary
-            summary = vlm_parsed.get("reasoning", f"Stage {current_stage} completed")
-            target_stage = next_stage if next_stage is not None else min(current_stage + 1, 6)
-            context.transition(target_stage, summary)
-            stages_completed = current_stage
-            current_stage = target_stage
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 6: 2x missing_reason, fallback to frontier 0")
+                        vlm_parsed = {"tool": "explore_frontier", "frontier_id": 0, "reason": "fallback"}
+                        consecutive_missing_reason = 0
+                    else:
+                        continue
 
-        # ═══════ STAGE 6: Final Answer ═══════
-        if not answer:
+                frontier_id = int(vlm_parsed.get("frontier_id", 0))
+                step_budget = max_total_steps - _low_level_steps()
+                pts, angle, success, status, obs_image = navigate_to_frontier(
+                    scene, tsdf_planner, pts, angle, frontier_id, cfg,
+                    memory_store, cam_intr, detection_model, sam_predictor,
+                    clip_model, clip_preprocess, clip_tokenizer, total_steps,
+                    step_budget=step_budget,
+                )
+                total_steps += 1
+                current_stage = 5
+
+        # ═══ Final Answer (Stage 6 fallback) ═══
+        if not answer and current_stage != "done":
             logger.info("--- Stage 6: Submit Answer ---")
-            context.start_stage(6)
-
-            s6_prompt = STAGE6_PROMPT.format(question=question)
-            context.add_message("user", s6_prompt)
-
-            messages = _build_messages(context)
+            stage_prompt = STAGE6_PROMPT.format(question=question)
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": stage_prompt},
+            ]
             vlm_response = call_vlm(messages)
             vlm_parsed = _parse_vlm_response(vlm_response)
-
             answer = vlm_parsed.get("answer", vlm_parsed.get("arguments", "unanswerable"))
             logger.info(f"Final answer: {answer}")
 
             result["answer"] = answer
             result["success"] = "unanswerable" not in answer.lower()
-            result["steps_taken"] = silent_perception_step._step_counter
+            result["steps_taken"] = _low_level_steps()
             result["stages_completed"] = 6
 
     except Exception as e:
