@@ -446,7 +446,10 @@ def run_episode(
                 logger.info(f"Stage 2 VLM: {vlm_parsed}")
 
                 if vlm_parsed.get("tool") == "navigate_to_object":
-                    view_idx = int(vlm_parsed.get("view_idx", 0))
+                    view_idx = vlm_parsed.get("view_idx", 0)
+                    if view_idx is None:
+                        view_idx = 0
+                    view_idx = int(view_idx)
                     view_idx = max(0, min(view_idx, len(panorama_views) - 1))
                     view_info = panorama_views[view_idx]
                     # Store view info for Stage 3
@@ -496,7 +499,10 @@ def run_episode(
                 logger.info(f"Stage 2.5a VLM: {vlm_parsed}")
 
                 if vlm_parsed.get("tool") == "explore_seed":
-                    seed_id = int(vlm_parsed.get("seed_id", seed_ids[0]))
+                    seed_id = vlm_parsed.get("seed_id", seed_ids[0])
+                    if seed_id is None:
+                        seed_id = seed_ids[0]
+                    seed_id = int(seed_id)
                     step_budget = max_total_steps - _low_level_steps()
                     pts, angle, success, status, obs_image = navigate_to_seed(
                         scene, tsdf_planner, pts, angle, seed_id, cfg,
@@ -617,7 +623,10 @@ def run_episode(
                     result["stages_completed"] = 5
                     current_stage = "done"
                 elif tool == "navigate_to_object":
-                    view_idx = int(vlm_parsed.get("view_idx", 1))
+                    view_idx = vlm_parsed.get("view_idx", 1)
+                    if view_idx is None:
+                        view_idx = 1
+                    view_idx = int(view_idx)
                     view_idx = max(0, min(view_idx, len(frontal_views) - 1))
                     view_info = frontal_views[view_idx]
                     pending_view = {
@@ -661,7 +670,10 @@ def run_episode(
                     else:
                         continue
 
-                frontier_id = int(vlm_parsed.get("frontier_id", 0))
+                frontier_id = vlm_parsed.get("frontier_id", 0)
+                if frontier_id is None:
+                    frontier_id = 0
+                frontier_id = int(frontier_id)
                 step_budget = max_total_steps - _low_level_steps()
                 pts, angle, success, status, obs_image = navigate_to_frontier(
                     scene, tsdf_planner, pts, angle, frontier_id, cfg,
