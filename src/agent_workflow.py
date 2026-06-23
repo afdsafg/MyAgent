@@ -389,6 +389,22 @@ def run_episode(
     stages_completed = 0
 
     try:
+        # Override room_segmentation config for broader room discovery
+        # (default area_source="explored" + observed_ratio_threshold=0.30
+        # only finds rooms the agent has physically visited; we need all
+        # navigable rooms visible from the panorama, per Obsidian notes
+        # MSGNav-调试渲染笔记-20260612-room-seg.md section "改进 v2")
+        from omegaconf import OmegaConf as _OC
+        if not hasattr(cfg.planner, "room_segmentation"):
+            cfg.planner.room_segmentation = _OC.create({})
+        rs = cfg.planner.room_segmentation
+        if not hasattr(rs, "area_source") or rs.area_source == "explored":
+            rs.area_source = "navigable"
+        if not hasattr(rs, "observed_ratio_threshold") or rs.observed_ratio_threshold > 0:
+            rs.observed_ratio_threshold = 0.0
+        if not hasattr(rs, "max_unobserved_room_hops") or rs.max_unobserved_room_hops < 10:
+            rs.max_unobserved_room_hops = 99
+
         # ═══ STAGE 1: 8-View Panorama ═══
         logger.info("--- Stage 1: Initial Panorama ---")
         pts, angle, mosaic_b64, pano_text, panorama_views = observe_panorama(
@@ -401,6 +417,7 @@ def run_episode(
         # SeedViewManager: register seeds from current frontier/room map
         seed_view_manager = SeedViewManager()
         if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
+            logger.info(f"Stage 1: found {len(tsdf_planner.room_regions)} rooms")
             for room in tsdf_planner.room_regions:
                 if room.room_state != "explored":
                     try:
@@ -409,6 +426,9 @@ def run_episode(
                             scene, tsdf_planner, pts)
                     except Exception:
                         pass
+            logger.info(f"Stage 1: registered {len(seed_view_manager.seeds)} seeds")
+        else:
+            logger.info("Stage 1: no room_regions found (room segmentation may have failed)")
 
         # ═══ STAGE 2-6: 6-Stage State Machine ═══
         current_stage = 2

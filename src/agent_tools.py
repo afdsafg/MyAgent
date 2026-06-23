@@ -208,6 +208,15 @@ def observe_panorama(
         skip_snapshots=True,
     )
 
+    # 触发房间分割 + frontier 更新（关键：8 视角全景后必须调用，
+    # 否则 room_regions 为空，SeedViewManager 注册不到任何 seed）
+    try:
+        tsdf_planner.update_frontier_map(
+            pts, cfg.planner, scene, cnt_step,
+            save_frontier_image=False)
+    except Exception as e:
+        logging.warning(f"observe_panorama: update_frontier_map failed: {e}")
+
     # 保存全景 8 张视角到 MemoryStore
     room_id = tsdf_planner.get_room_id_at(
         tsdf_planner.habitat2voxel(pts)[:2])
