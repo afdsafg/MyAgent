@@ -682,33 +682,44 @@ def _format_frontiers_info(tsdf_planner) -> str:
 
 
 def _parse_vlm_response(response: str) -> dict:
-    """Parse VLM JSON response."""
-    if response is None:
-        response = ""
-    try:
-        # Try to find JSON block
-        if "```" in response:
-            # Extract content between first ``` and last ```
-            parts = response.split("```")
-            for part in parts:
-                part = part.strip()
-                if part.startswith("json"):
-                    part = part[4:]
-                try:
-                    return json.loads(part.strip())
-                except json.JSONDecodeError:
-                    continue
+    """Parse VLM JSON response. Enforce mandatory 'reason' field.
 
-        # Try direct JSON parse
-        return json.loads(response.strip())
-    except (json.JSONDecodeError, Exception) as e:
-        logger.warning(f"Failed to parse VLM response as JSON: {e}")
-        return {
-            "reasoning": response[:200],
-            "tool": "unknown",
-            "arguments": "",
-            "answer": "",
-        }
+    Returns dict with at least:
+        - tool: str (action name, or 'parse_error'/'missing_reason')
+        - reason: str (may be empty if missing)
+        - raw: str (original response, only on error)
+    """
+    import json as _json
+
+    # Try to extract JSON from response (VLM may add prose around it)
+    text = response.strip() if response else ""
+    # Find first { and last }
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1 or end <= start:
+        return {"tool": "parse_error", "reason": "", "raw": response}
+
+    try:
+        parsed = _json.loads(text[start:end + 1])
+    except _json.JSONDecodeError:
+        return {"tool": "parse_error", "reason": "", "raw": response}
+
+    # Enforce reason field
+    reason = parsed.get("reason", "").strip()
+    if not reason:
+        return {"tool": "missing_reason", "reason": "", "raw": response}
+
+    parsed["reason"] = reason
+
+    # Determine tool from action or frontier_id presence
+    if "frontier_id" in parsed:
+        parsed["tool"] = "explore_frontier"
+    elif "object" in parsed and "action" not in parsed:
+        parsed["tool"] = "object_selected"
+    else:
+        parsed["tool"] = parsed.get("action", "")
+
+    return parsed
 
 
 # ── Direct Run (for testing) ────────────────────────────────────────────
