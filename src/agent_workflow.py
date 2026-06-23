@@ -765,12 +765,14 @@ def _register_new_seeds(seed_view_manager, tsdf_planner, scene, agent_pts):
         if room.room_id not in existing_ids:
             try:
                 # room.center is 2D voxel [vy, vx], convert to 3D habitat
-                center_voxel = np.array([room.center[0], room.center[1], 0], dtype=int)
-                center_normal = tsdf_planner.voxel2normal(center_voxel)
-                # Pin height to agent's floor height
-                center_normal_3d = np.array([
-                    center_normal[0], center_normal[1], float(agent_pts[1])])
-                center_habitat = pos_normal_to_habitat(center_normal_3d)
+                # Per debug_render_episode.py:878-885, use _vol_bnds + 0.5 offset
+                # (voxel center, not corner) and pin height to eye level 1.5m
+                vy, vx = int(room.center[0]), int(room.center[1])
+                voxel_size = tsdf_planner._voxel_size
+                world_y = tsdf_planner._vol_bnds[0, 0] + (vy + 0.5) * voxel_size
+                world_x = tsdf_planner._vol_bnds[1, 0] + (vx + 0.5) * voxel_size
+                seed_normal = np.asarray([world_y, world_x, 1.5], dtype=float)
+                center_habitat = pos_normal_to_habitat(seed_normal)
                 seed_view_manager.register_seed(
                     room.room_id, center_habitat,
                     scene, tsdf_planner, agent_pts)
