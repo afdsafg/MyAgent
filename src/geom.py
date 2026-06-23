@@ -654,6 +654,37 @@ def get_random_snapshot_observation_point(
     return target_obs_point
 
 
+def bresenham_2d(start, end):
+    """Bresenham line algorithm on 2D grid.
+
+    Args:
+        start: (y, x) tuple or array
+        end: (y, x) tuple or array
+    Returns:
+        List of (y, x) tuples from start to end inclusive.
+    """
+    y0, x0 = int(start[0]), int(start[1])
+    y1, x1 = int(end[0]), int(end[1])
+    points = []
+    dy = abs(y1 - y0)
+    dx = abs(x1 - x0)
+    sy = 1 if y0 < y1 else -1
+    sx = 1 if x0 < x1 else -1
+    err = dx - dy
+    while True:
+        points.append((y0, x0))
+        if y0 == y1 and x0 == x1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+        if e2 < dx:
+            err += dx
+            y0 += sy
+    return points
+
+
 def get_near_navigable_point(p, pathfinder, radius=0.2):
     # p: [3] array in habitat coordinate
     # radius: the radius for searching the navigable point
