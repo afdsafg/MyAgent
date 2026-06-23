@@ -234,8 +234,21 @@ def observe_panorama(
 
     # 直接调用 update_room_map（不依赖 update_frontier_map，因为后者
     # 在 frontier 为空时会提前 return，跳过 room segmentation）
+    # 关键：Step 0 全景后大部分房间未充分观察（<30%），用配置的
+    # observed_ratio_threshold=0.30 会过滤掉所有未探索房间。
+    # 初始分割时强制用 0.0，接受所有房间（含 hypothesis）。
+    # 后续 update_frontier_map 调用会用品配置的 0.30 重新过滤。
     try:
-        tsdf_planner.update_room_map(cfg=cfg.planner, pts=pts_normal)
+        from omegaconf import OmegaConf as _OC
+        room_cfg = tsdf_planner._cfg_get(cfg.planner, "room_segmentation", None)
+        if room_cfg is not None:
+            # Copy and override for initial segmentation
+            room_cfg_init = _OC.create(_OC.to_container(room_cfg))
+            room_cfg_init.observed_ratio_threshold = 0.0
+            room_cfg_init.max_unobserved_room_hops = 99
+        else:
+            room_cfg_init = cfg.planner
+        tsdf_planner.update_room_map(cfg=room_cfg_init, pts=pts_normal)
     except Exception as e:
         logging.warning(f"observe_panorama: update_room_map failed: {e}")
 
