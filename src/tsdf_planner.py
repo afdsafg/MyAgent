@@ -451,8 +451,14 @@ class TSDFPlanner(TSDFPlannerBase):
                 frontier.feature = processed_rgb
 
         # Update room segmentation
+        # Per MSGNav-main (2): read room_segmentation sub-config from cfg,
+        # then pass the sub-config to update_room_map (not the full cfg)
         if pts is not None:
-            room_success = self.update_room_map(cfg=cfg, pts=pts)
+            room_cfg = self._cfg_get(cfg, "room_segmentation", None)
+            if room_cfg is not None:
+                room_success = self.update_room_map(cfg=room_cfg, pts=pts)
+            else:
+                room_success = self.update_room_map(cfg=cfg, pts=pts)
 
         return True
 

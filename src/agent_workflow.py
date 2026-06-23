@@ -389,27 +389,6 @@ def run_episode(
     stages_completed = 0
 
     try:
-        # Override room_segmentation config for broader room discovery
-        # (default area_source="explored" + observed_ratio_threshold=0.30
-        # only finds rooms the agent has physically visited; we need all
-        # navigable rooms visible from the panorama, per Obsidian notes
-        # MSGNav-调试渲染笔记-20260612-room-seg.md section "改进 v2")
-        # Note: _cfg_get reads attrs directly from cfg.planner, not from
-        # a room_segmentation sub-config, so we set attrs on cfg.planner
-        from omegaconf import OmegaConf as _OC
-        if not hasattr(cfg.planner, "area_source"):
-            cfg.planner.area_source = "navigable"
-        else:
-            cfg.planner.area_source = "navigable"
-        if not hasattr(cfg.planner, "observed_ratio_threshold"):
-            cfg.planner.observed_ratio_threshold = 0.0
-        else:
-            cfg.planner.observed_ratio_threshold = 0.0
-        if not hasattr(cfg.planner, "max_unobserved_room_hops"):
-            cfg.planner.max_unobserved_room_hops = 99
-        else:
-            cfg.planner.max_unobserved_room_hops = 99
-
         # ═══ STAGE 1: 8-View Panorama ═══
         logger.info("--- Stage 1: Initial Panorama ---")
         pts, angle, mosaic_b64, pano_text, panorama_views = observe_panorama(
