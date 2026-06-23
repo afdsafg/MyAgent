@@ -1,4 +1,5 @@
 results/
+.worktrees/
 *.pt
 *.pyc
 *.xml
