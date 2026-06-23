@@ -423,14 +423,7 @@ def run_episode(
         seed_view_manager = SeedViewManager()
         if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
             logger.info(f"Stage 1: found {len(tsdf_planner.room_regions)} rooms")
-            for room in tsdf_planner.room_regions:
-                if room.room_state != "explored":
-                    try:
-                        seed_view_manager.register_seed(
-                            room.room_id, room.center.astype(np.float64),
-                            scene, tsdf_planner, pts)
-                    except Exception:
-                        pass
+            _register_new_seeds(seed_view_manager, tsdf_planner, scene, pts)
             logger.info(f"Stage 1: registered {len(seed_view_manager.seeds)} seeds")
         else:
             logger.info("Stage 1: no room_regions found (room segmentation may have failed)")
@@ -761,6 +754,9 @@ def _register_new_seeds(seed_view_manager, tsdf_planner, scene, agent_pts):
     # Find which room the agent is currently in
     agent_voxel = tsdf_planner.habitat2voxel(agent_pts)[:2]
     agent_room_id = tsdf_planner.get_room_id_at(agent_voxel)
+    logger.info(f"_register_new_seeds: agent_room_id={agent_room_id}, "
+                f"existing_ids={existing_ids}, "
+                f"room_ids={[r.room_id for r in tsdf_planner.room_regions]}")
     for room in tsdf_planner.room_regions:
         # Skip the room the agent is already in
         if room.room_id == agent_room_id:
@@ -770,8 +766,9 @@ def _register_new_seeds(seed_view_manager, tsdf_planner, scene, agent_pts):
                 seed_view_manager.register_seed(
                     room.room_id, room.center.astype(np.float64),
                     scene, tsdf_planner, agent_pts)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"_register_new_seeds: failed to register "
+                              f"seed {room.room_id}: {e}")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
