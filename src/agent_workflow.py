@@ -184,8 +184,7 @@ For the question: "{question}"
 Decide:
 - If you see a relevant object in one of the views -> navigate_to_object with view_idx
 - If no relevant object visible in any view -> explore_other_room
-
-{SCHEMA_REQUIREMENT}
+""" + SCHEMA_REQUIREMENT + """
 
 Actions:
 1. navigate_to_object: {{"reason": "...", "action": "navigate_to_object", "view_idx": <0-7>}}
@@ -204,8 +203,7 @@ For the question: "{question}"
 Decide:
 - If a seed seems relevant -> explore_seed with seed_id
 - If all seeds seem irrelevant -> explore_frontier (fallback)
-
-{SCHEMA_REQUIREMENT}
+""" + SCHEMA_REQUIREMENT + """
 
 Actions:
 1. explore_seed: {{"reason": "...", "action": "explore_seed", "seed_id": <id>}}
@@ -222,8 +220,7 @@ You MUST output ONE concrete physical object name visible in this image that
 will serve as your navigation anchor. The object must be:
 - A concrete noun phrase a detector can find (e.g. "oven", "the red door", "towel")
 - NOT a room name, direction, or abstract concept
-
-{SCHEMA_REQUIREMENT}
+""" + SCHEMA_REQUIREMENT + """
 
 Output: {{"reason": "...", "object": "<object_name>"}}
 """
@@ -240,8 +237,7 @@ Decide:
 - If you can answer the question now -> submit_answer
 - If you see a new relevant object in one of the 3 views -> navigate_to_object
 - If you need to explore other rooms -> explore_other_room
-
-{SCHEMA_REQUIREMENT}
+""" + SCHEMA_REQUIREMENT + """
 
 Actions:
 1. navigate_to_object: {{"reason": "...", "action": "navigate_to_object", "view_idx": <0-2>}}
@@ -258,8 +254,7 @@ You decided to explore frontiers. Here are all available frontiers:
 For the question: "{question}"
 
 Select the most promising frontier to explore next.
-
-{SCHEMA_REQUIREMENT}
+""" + SCHEMA_REQUIREMENT + """
 
 Output: {{"reason": "...", "frontier_id": <id>}}
 """
