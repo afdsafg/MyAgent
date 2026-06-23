@@ -394,16 +394,21 @@ def run_episode(
         # only finds rooms the agent has physically visited; we need all
         # navigable rooms visible from the panorama, per Obsidian notes
         # MSGNav-调试渲染笔记-20260612-room-seg.md section "改进 v2")
+        # Note: _cfg_get reads attrs directly from cfg.planner, not from
+        # a room_segmentation sub-config, so we set attrs on cfg.planner
         from omegaconf import OmegaConf as _OC
-        if not hasattr(cfg.planner, "room_segmentation"):
-            cfg.planner.room_segmentation = _OC.create({})
-        rs = cfg.planner.room_segmentation
-        if not hasattr(rs, "area_source") or rs.area_source == "explored":
-            rs.area_source = "navigable"
-        if not hasattr(rs, "observed_ratio_threshold") or rs.observed_ratio_threshold > 0:
-            rs.observed_ratio_threshold = 0.0
-        if not hasattr(rs, "max_unobserved_room_hops") or rs.max_unobserved_room_hops < 10:
-            rs.max_unobserved_room_hops = 99
+        if not hasattr(cfg.planner, "area_source"):
+            cfg.planner.area_source = "navigable"
+        else:
+            cfg.planner.area_source = "navigable"
+        if not hasattr(cfg.planner, "observed_ratio_threshold"):
+            cfg.planner.observed_ratio_threshold = 0.0
+        else:
+            cfg.planner.observed_ratio_threshold = 0.0
+        if not hasattr(cfg.planner, "max_unobserved_room_hops"):
+            cfg.planner.max_unobserved_room_hops = 99
+        else:
+            cfg.planner.max_unobserved_room_hops = 99
 
         # ═══ STAGE 1: 8-View Panorama ═══
         logger.info("--- Stage 1: Initial Panorama ---")

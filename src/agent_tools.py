@@ -210,6 +210,36 @@ def observe_panorama(
 
     # 触发房间分割 + frontier 更新（关键：8 视角全景后必须调用，
     # 否则 room_regions 为空，SeedViewManager 注册不到任何 seed）
+    # 先刷新 grid（update_frontier_map 内部会做，但如果 frontier 为空
+    # 它会提前 return False，跳过 update_room_map，所以这里先手动刷新）
+    try:
+        from src.habitat import pos_habitat_to_normal
+        import scipy.ndimage as _ndimage
+        pts_normal = pos_habitat_to_normal(pts)
+        island, unoccupied = tsdf_planner.get_island_around_pts(
+            pts_normal, height=tsdf_planner.occupancy_height)
+        tsdf_planner.unoccupied = unoccupied
+        tsdf_planner.island = island
+        tsdf_planner.unexplored = (np.sum(tsdf_planner._explore_vol_cpu, axis=-1) == 0).astype(int)
+        for point in tsdf_planner.init_points:
+            tsdf_planner.unexplored[point[0], point[1]] = 0
+        tsdf_planner.occupied = np.logical_not(tsdf_planner.unoccupied).astype(int)
+        kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]])
+        tsdf_planner.unexplored_neighbors = _ndimage.convolve(
+            tsdf_planner.unexplored, kernel, mode="constant", cval=0.0)
+        tsdf_planner.occupied_map_camera = np.logical_not(
+            tsdf_planner.get_island_around_pts(pts_normal, height=tsdf_planner.vision_height)[0])
+    except Exception as e:
+        logging.warning(f"observe_panorama: grid refresh failed: {e}")
+
+    # 直接调用 update_room_map（不依赖 update_frontier_map，因为后者
+    # 在 frontier 为空时会提前 return，跳过 room segmentation）
+    try:
+        tsdf_planner.update_room_map(cfg=cfg.planner, pts=pts_normal)
+    except Exception as e:
+        logging.warning(f"observe_panorama: update_room_map failed: {e}")
+
+    # 也尝试 update_frontier_map（可能发现 frontier）
     try:
         tsdf_planner.update_frontier_map(
             pts, cfg.planner, scene, cnt_step,
