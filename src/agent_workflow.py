@@ -748,6 +748,7 @@ def _register_new_seeds(seed_view_manager, tsdf_planner, scene, agent_pts):
     room_state can be 'observed', 'hypothesis', or 'unknown' — all are
     valid seeds (we want to navigate to other rooms to explore them).
     """
+    from src.habitat import pos_normal_to_habitat
     if not hasattr(tsdf_planner, "room_regions") or not tsdf_planner.room_regions:
         return
     existing_ids = set(seed_view_manager.seeds.keys())
@@ -763,8 +764,15 @@ def _register_new_seeds(seed_view_manager, tsdf_planner, scene, agent_pts):
             continue
         if room.room_id not in existing_ids:
             try:
+                # room.center is 2D voxel [vy, vx], convert to 3D habitat
+                center_voxel = np.array([room.center[0], room.center[1], 0], dtype=int)
+                center_normal = tsdf_planner.voxel2normal(center_voxel)
+                # Pin height to agent's floor height
+                center_normal_3d = np.array([
+                    center_normal[0], center_normal[1], float(agent_pts[1])])
+                center_habitat = pos_normal_to_habitat(center_normal_3d)
                 seed_view_manager.register_seed(
-                    room.room_id, room.center.astype(np.float64),
+                    room.room_id, center_habitat,
                     scene, tsdf_planner, agent_pts)
             except Exception as e:
                 logger.warning(f"_register_new_seeds: failed to register "
