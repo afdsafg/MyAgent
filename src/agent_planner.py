@@ -157,7 +157,8 @@ class Planner:
                 answer=args.get("answer") or data.get("answer"),
             )
 
-        # Keyword fallback
+        # Keyword fallback with ID extraction
+        import re
         raw_l = raw.lower()
         for kw, action in [
             ("submit_answer", "submit_answer"),
@@ -169,11 +170,20 @@ class Planner:
             if kw in raw_l:
                 if action == "submit_answer":
                     ans = raw.strip().split('\n')[-1][:300]
-                    return PlannerAction(action_type=action, answer=ans,
-                                        reason="Inferred", confidence=0.5)
-                return PlannerAction(action_type=action, reason="Inferred",
-                                    confidence=0.4,
-                                    object_name="oven" if action == "navigate_to_object" else None)
+                    return PlannerAction(action_type=action, answer=ans, reason="Inferred", confidence=0.5)
+                if action == "explore_seed":
+                    m = re.search(r'(?:seed|room)[_\s]*(\d+)', raw_l)
+                    sid = str(m.group(1)) if m else None
+                    return PlannerAction(action_type=action, seed_id=sid, reason="Inferred", confidence=0.4)
+                if action == "explore_frontier":
+                    m = re.search(r'frontier[_\s]*(\d+)', raw_l)
+                    fid = str(m.group(1)) if m else None
+                    return PlannerAction(action_type=action, frontier_id=fid, reason="Inferred", confidence=0.4)
+                if action == "navigate_to_object":
+                    m = re.search(r'(?:navigate_to_object|navigate to|go to|find)\s*["\']?(\w+)["\']?', raw_l)
+                    obj = m.group(1) if m else "oven"
+                    return PlannerAction(action_type=action, object_name=obj, reason="Inferred", confidence=0.4)
+                return PlannerAction(action_type=action, reason="Inferred", confidence=0.4)
 
         logger.info("Planner parse fallback, raw[:200]=%s", raw[:200])
         return PlannerAction(action_type="explore_panorama",

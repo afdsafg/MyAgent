@@ -1114,20 +1114,32 @@ def run_episode_two_tier(
 
         def _build_actions() -> str:
             lines = ["## Actions"]
-            lines.append("1. explore_panorama")
-            lines.append("2. navigate_to_object <object_name>")
-            lines.append("3. explore_seed <seed_id>")
-            lines.append("4. explore_frontier <frontier_id>")
-            lines.append("5. inspect_object <object_name>")
-            lines.append("6. submit_answer <answer>")
+            lines.append("1. explore_panorama: re-orient with full panorama")
+            lines.append("2. navigate_to_object <name>: use detector to move toward an object")
+            
+            # List available seeds with room info
+            if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
+                current_room = tsdf_planner.get_room_id_at(tsdf_planner.habitat2voxel(pts)[:2]) if pts is not None else -1
+                available = [r for r in tsdf_planner.room_regions if r.room_id != current_room]
+                if available:
+                    lines.append("Available seeds (explore different rooms):")
+                    for r in available:
+                        lines.append(f"  - Seed {r.room_id}: room_id={r.room_id}, area={r.area:.0f}, observed={r.observed_ratio:.0%}")
+            
+            # List available frontiers
+            if hasattr(tsdf_planner, "frontiers") and tsdf_planner.frontiers:
+                lines.append("Available frontiers:")
+                for ft in tsdf_planner.frontiers[:8]:
+                    lines.append(f"  - Frontier {ft.frontier_id}: room_id={getattr(ft, 'room_id', '?')}")
+            
+            lines.append("4. explore_frontier <id>: navigate to one of the frontiers above")
+            lines.append("5. navigate_to_object <name>: approach a detected object")
+            lines.append("6. submit_answer <answer>: submit final answer")
+            
             visited_seeds = notebook.get_visited_seeds()
             visited_frontiers = notebook.get_visited_frontiers()
             if visited_seeds or visited_frontiers:
-                lines.append("")
-                if visited_seeds:
-                    lines.append(f"Exhausted seeds: {', '.join(sorted(visited_seeds))}")
-                if visited_frontiers:
-                    lines.append(f"Exhausted frontiers: {', '.join(sorted(visited_frontiers))}")
+                lines.append(f"Exhausted: {', '.join(sorted(visited_seeds | visited_frontiers))}")
             return "\n".join(lines)
 
         # ── Planner-Executor loop ────────────────────────────────────
