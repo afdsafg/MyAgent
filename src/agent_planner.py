@@ -45,9 +45,7 @@ PLANNER_SYSTEM_PROMPT = (
     '   Arguments: {{"seed_id": "3"}}\n'
     "4. explore_frontier: Navigate to an unexplored frontier.\n"
     '   Arguments: {{"frontier_id": "14"}}\n'
-    "5. inspect_object: Stay in place, closely examine an object.\n"
-    '   Arguments: {{"object_name": "oven"}}\n'
-    "6. submit_answer: Submit the final answer to the question.\n"
+    "5. submit_answer: Submit the final answer to the question.\n"
     '   Arguments: {{"answer": "the towel is white"}}\n\n'
     "Response Format:\n"
     '{{"reasoning": "why this action", "action": "<action_name>", "arguments": {{...}}, "confidence": 0.8}}\n\n'

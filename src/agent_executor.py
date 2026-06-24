@@ -245,42 +245,6 @@ class Executor:
             objects_nearby=self._collect_nearby(pts),
         )
 
-    def inspect_object(self, object_name: str) -> TrajectoryEvidence:
-        from src.agent_tools import silent_perception_step
-
-        pts, angle = silent_perception_step(
-            self.scene,
-            self.tsdf,
-            self._pts,
-            self._angle,
-            self._step_counter,
-            self.memory,
-            self.scene.cam_intrinsic,
-            self.cfg,
-            self.models["detection"],
-            self.models["sam"],
-            self.models["clip"],
-            self.models["clip_preprocess"],
-            self.models["clip_tokenizer"],
-        )
-        self._pts, self._angle = pts, angle
-
-        room_id = (
-            self.tsdf.get_room_id_at(self.tsdf.habitat2voxel(pts)[:2])
-            if hasattr(self.tsdf, "get_room_id_at")
-            else -1
-        )
-
-        return TrajectoryEvidence(
-            subgoal=f"Inspect {object_name} at current position",
-            task_mode="inspect_object",
-            progress=f"Close inspection of {object_name}",
-            salient=[object_name],
-            outcome="inspection_complete",
-            room_id=room_id,
-            objects_nearby=self._collect_nearby(pts),
-        )
-
     # ── dispatch ──────────────────────────────────────────────────────
 
     def execute_action(self, action) -> TrajectoryEvidence:

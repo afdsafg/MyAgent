@@ -1132,9 +1132,9 @@ def run_episode_two_tier(
                 for ft in tsdf_planner.frontiers[:8]:
                     lines.append(f"  - Frontier {ft.frontier_id}: room_id={getattr(ft, 'room_id', '?')}")
             
-            lines.append("4. explore_frontier <id>: navigate to one of the frontiers above")
-            lines.append("5. navigate_to_object <name>: approach a detected object")
-            lines.append("6. submit_answer <answer>: submit final answer")
+            lines.append("3. explore_frontier <id>: navigate to one of the frontiers above")
+            lines.append("4. navigate_to_object <name>: use detector to approach detected object")
+            lines.append("5. submit_answer <answer>: submit final answer")
             
             visited_seeds = notebook.get_visited_seeds()
             visited_frontiers = notebook.get_visited_frontiers()
