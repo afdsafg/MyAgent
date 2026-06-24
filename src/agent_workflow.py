@@ -133,7 +133,7 @@ You operate in a 6-stage workflow. In each stage you have specific goals and too
 Available tools:
 - observe_panorama: Take an 8-view panorama. Returns a mosaic image showing all directions and room/frontier information.
 - view_direction <direction>: Look toward "left", "right", "forward", or "backward". Returns the RGB image from that direction.
-- navigate_to_object <object_description>: Use GroundingDINO to detect the described object and navigate toward it. Returns success/failure and status. The <object_description> MUST be a concrete noun phrase that GroundingDINO can detect, e.g. "oven", "the red door", "towel hanging on oven handle", "coffee table". Do NOT use room names, directions, or abstract concepts — only physical objects.
+- navigate_to_object <object_description>: Use GroundingDINO to detect the described object and navigate toward it. Returns success/failure and status. The <object_description> MUST be a concrete noun phrase that GroundingDINO can detect, e.g. "oven", "the red door", "white cabinet on the wall", "coffee table". Do NOT use room names, directions, or abstract concepts — only physical objects.
 - navigate_to_seed <room_id>: Navigate toward the center of the specified room (e.g. "1").
 - navigate_to_frontier <frontier_id>: Navigate toward the specified unexplored frontier (e.g. "0").
 - query_memory <text_query>: Search past observations for relevant images. Returns a mosaic of matching snapshots (max 2 queries per episode).
@@ -224,7 +224,7 @@ For the question: "{question}"
 
 You MUST output ONE concrete physical object name visible in this image that
 will serve as your navigation anchor. The object must be:
-- A concrete noun phrase a detector can find (e.g. "oven", "the red door", "towel")
+- A concrete noun phrase a detector can find (e.g. "oven", "the red door", "a white cabinet")
 - NOT a room name, direction, or abstract concept
 """ + SCHEMA_REQUIREMENT + """
 
