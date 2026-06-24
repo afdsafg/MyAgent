@@ -1171,7 +1171,7 @@ def run_episode_two_tier(
             logger.info(
                 "Round %d: action=%s confidence=%.2f reason=%s pos=(%.1f,%.1f)",
                 rounds_used, action.action_type, action.confidence, action.reason,
-                pts[0], pts[2],
+                pts[0], pts[2])
 
             # Check submit_answer
             if action.action_type == "submit_answer":
