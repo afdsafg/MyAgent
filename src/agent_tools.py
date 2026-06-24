@@ -208,6 +208,30 @@ def observe_panorama(
         skip_snapshots=True,
     )
 
+    # 关键：silent_perception_step 只融合 3 个前视角到 TSDF，
+    # 但全景有 8 个视角。需要把另外 5 个视角也融合到 TSDF，
+    # 否则 room segmentation 只有 3 个视角的覆盖（3317 voxels），
+    # 找不到 4 个房间（需要 8 视角的 5069 voxels 覆盖）。
+    from src.habitat import pose_habitat_to_tsdf as _pose_to_tsdf
+    for v in panorama_views:
+        # 跳过 silent_perception_step 已融合的 3 个视角
+        if v["direction"] in ["front", "left", "right"]:
+            continue
+        try:
+            obs_v, cam_pose_v = scene.get_observation(pts, v["angle"])
+            tsdf_planner.integrate(
+                color_im=obs_v["color_sensor"],
+                depth_im=obs_v["depth_sensor"],
+                cam_intr=cam_intr,
+                cam_pose=_pose_to_tsdf(cam_pose_v),
+                obs_weight=1.0,
+                margin_h=int(cfg.margin_h_ratio * cfg.img_height),
+                margin_w=int(cfg.margin_w_ratio * cfg.img_width),
+                explored_depth=cfg.explored_depth,
+            )
+        except Exception as e:
+            logging.warning(f"observe_panorama: extra TSDF integrate failed for {v['direction']}: {e}")
+
     # 触发房间分割 + frontier 更新（关键：8 视角全景后必须调用，
     # 否则 room_regions 为空，SeedViewManager 注册不到任何 seed）
     # 先刷新 grid（update_frontier_map 内部会做，但如果 frontier 为空
