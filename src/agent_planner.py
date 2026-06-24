@@ -120,33 +120,53 @@ class Planner:
 
     def parse_response(self, response: str) -> PlannerAction:
         """Parse VLM JSON response into a PlannerAction."""
-        try:
-            json_str = response
-            if "{" in response:
-                start = response.index("{")
-                end = response.rindex("}") + 1
-                json_str = response[start:end]
-            data = json.loads(json_str)
+        import re
+        data = None
+        raw = response.strip()
 
-            def _to_str(v):
-                return str(v) if v is not None else None
+        # Try ```json ... ``` code fences
+        m = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', raw, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                pass
 
+        # Try raw { ... } extraction
+        if data is None and "{" in raw:
+            try:
+                start = raw.index("{")
+                end = raw.rindex("}") + 1
+                data = json.loads(raw[start:end])
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        if data is not None:
             return PlannerAction(
                 action_type=data.get("action", "explore_panorama"),
                 reason=data.get("reason", ""),
                 confidence=float(data.get("confidence", 0.5)),
                 object_name=data.get("object_name"),
-                seed_id=_to_str(data.get("seed_id")),
-                frontier_id=_to_str(data.get("frontier_id")),
+                seed_id=str(data.get("seed_id")) if data.get("seed_id") is not None else None,
+                frontier_id=str(data.get("frontier_id")) if data.get("frontier_id") is not None else None,
                 view_idx=data.get("view_idx"),
                 answer=data.get("answer"),
             )
-        except (json.JSONDecodeError, ValueError, TypeError):
-            return PlannerAction(
-                action_type="explore_panorama",
-                reason="Failed to parse VLM response",
-                confidence=0.0,
-            )
+
+        # Fallback: keyword-based action inference from natural language
+        raw_l = raw.lower()
+        if "submit_answer" in raw_l or "answer is" in raw_l:
+            ans = raw.split("answer is")[-1].strip().strip('"').strip()
+            return PlannerAction(action_type="submit_answer", answer=ans[:200], reason="Inferred", confidence=0.5)
+        if "navigate_to_object" in raw_l or "go to" in raw_l or "move to" in raw_l:
+            return PlannerAction(action_type="navigate_to_object", reason="Inferred", confidence=0.4, object_name="oven")
+        if "explore_seed" in raw_l or "go to seed" in raw_l:
+            return PlannerAction(action_type="explore_seed", reason="Inferred", confidence=0.4)
+        if "explore_frontier" in raw_l or "frontier" in raw_l:
+            return PlannerAction(action_type="explore_frontier", reason="Inferred", confidence=0.4)
+
+        logger.debug("Planner parse failed, raw=%.200s", raw)
+        return PlannerAction(action_type="explore_panorama", reason="Parse failed", confidence=0.0)
 
     def _call_api(self, messages: list[dict]) -> str:
         """Call mimo-v2.5 via requests.post (matches original call_vlm pattern)."""

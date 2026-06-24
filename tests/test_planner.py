@@ -45,7 +45,7 @@ def test_parse_planner_response_with_markdown(planner):
 def test_parse_planner_response_bad_json_fallback(planner):
     action = planner.parse_response("This is not JSON at all.")
     assert action.action_type == "explore_panorama"
-    assert "Failed to parse" in action.reason
+    assert "Parse failed" in action.reason
 
 
 def test_build_prompt_contains_components(planner):
