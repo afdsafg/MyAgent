@@ -11,6 +11,8 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
+import requests
+
 import openai
 
 from src.const import (
@@ -147,13 +149,36 @@ class Planner:
             )
 
     def _call_api(self, messages: list[dict]) -> str:
-        """Call Qwen3.6-Plus via OpenAI-compatible API."""
-        client = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
-        response = client.chat.completions.create(
-            model=self.model_name,
-            messages=messages,
-            temperature=0.3,
-            max_tokens=1024,
-        )
-        content = response.choices[0].message.content
-        return content if content is not None else ""
+        """Call mimo-v2.5 via requests.post (matches original call_vlm pattern)."""
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "max_tokens": 1024,
+            "temperature": 0.3,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        proxies = {}
+        proxy_http = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
+        proxy_https = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+        if proxy_http:
+            proxies["http"] = proxy_http
+        if proxy_https:
+            proxies["https"] = proxy_https
+
+        try:
+            resp = requests.post(
+                self.base_url, json=payload, headers=headers,
+                timeout=180, proxies=proxies if proxies else None)
+        except Exception as e:
+            logger.error(f"Planner API request failed: {e}")
+            return ""
+
+        if resp.status_code != 200:
+            logger.error(f"Planner API error: {resp.status_code} {resp.text[:500]}")
+            return ""
+
+        data = resp.json()
+        return data["choices"][0]["message"].get("content", "")
