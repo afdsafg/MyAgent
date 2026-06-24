@@ -125,6 +125,8 @@ def _navigate_to_target_with_agent_step(
     substeps = 0
     arrived = False
     cur_pts, cur_angle = pts, angle
+    stuck_count = 0
+    last_pts = cur_pts.copy()
 
     for substeps in range(1, max_substeps + 1):
         # 检查底层步数配额
@@ -142,6 +144,16 @@ def _navigate_to_target_with_agent_step(
             return cur_pts, cur_angle, False, "agent_step failed", substeps - 1
 
         cur_pts, cur_angle, _, _, _, target_arrived = result
+
+        # 卡死检测：连续5步子步位移<0.1m则提前退出
+        if np.linalg.norm(cur_pts - last_pts) < 0.1:
+            stuck_count += 1
+        else:
+            stuck_count = 0
+        last_pts = cur_pts.copy()
+        if stuck_count >= 5:
+            logging.warning("Agent stuck: no progress after 5 substeps, aborting navigation")
+            break
 
         # 每个子步都做静默感知并存档
         silent_perception_step(
