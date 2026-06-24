@@ -314,12 +314,14 @@ def run_episode(
     from src.run_logger import RunLogger
     viz_cfg = getattr(cfg, 'visualization', {})
     if hasattr(viz_cfg, 'enabled'):
-        viz_cfg = OmegaConf.to_container(viz_cfg, resolve=True)
+        # OmegaConf DictConfig → plain dict for .get() access
+        viz_cfg = {k: getattr(viz_cfg, k) for k in
+                   ['enabled', 'output_root', 'save_nav_topdown',
+                    'save_nav_views', 'save_seed_history', 'dpi']
+                   if hasattr(viz_cfg, k)}
     run_logger = RunLogger(
-        output_root=viz_cfg.get('output_root',
-                                getattr(cfg, 'visualization_output_root', 'results')),
-        enabled=viz_cfg.get('enabled',
-                             getattr(cfg, 'save_visualization', True)),
+        output_root=viz_cfg.get('output_root', 'results'),
+        enabled=viz_cfg.get('enabled', True),
         save_nav_topdown=viz_cfg.get('save_nav_topdown', True),
         save_nav_views=viz_cfg.get('save_nav_views', False),
         save_seed_history=viz_cfg.get('save_seed_history', False),
