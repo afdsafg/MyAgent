@@ -292,12 +292,28 @@ def observe_panorama(
         import traceback; traceback.print_exc()
 
     # 也尝试 update_frontier_map（可能发现 frontier）
+    # 但注意：update_frontier_map 内部会调用 update_room_map 覆盖
+    # 我们的自构分割结果。所以先保存，调用后恢复。
+    _saved_room_map = tsdf_planner.room_map
+    _saved_room_regions = tsdf_planner.room_regions
     try:
         tsdf_planner.update_frontier_map(
             pts, cfg.planner, scene, cnt_step,
             save_frontier_image=False)
+        # update_frontier_map may have overwritten room_regions via its
+        # internal update_room_map call. Restore our self-constructed
+        # segmentation if it had more rooms.
+        if (len(tsdf_planner.room_regions) < len(_saved_room_regions)
+            and _saved_room_regions is not None):
+            tsdf_planner.room_map = _saved_room_map
+            tsdf_planner.room_regions = _saved_room_regions
+            logging.info(f"observe_panorama: restored {len(_saved_room_regions)} rooms "
+                        f"(update_frontier_map reduced to {len(tsdf_planner.room_regions)})")
     except Exception as e:
         logging.warning(f"observe_panorama: update_frontier_map failed: {e}")
+        # Restore on failure too
+        tsdf_planner.room_map = _saved_room_map
+        tsdf_planner.room_regions = _saved_room_regions
 
     # 保存全景 8 张视角到 MemoryStore
     room_id = tsdf_planner.get_room_id_at(
