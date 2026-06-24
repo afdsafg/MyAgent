@@ -256,8 +256,6 @@ class Executor:
             return self.explore_seed(action.seed_id)
         elif action.action_type == "explore_frontier":
             return self.explore_frontier(action.frontier_id)
-        elif action.action_type == "inspect_object":
-            return self.inspect_object(action.object_name)
         elif action.action_type == "submit_answer":
             return TrajectoryEvidence(
                 subgoal="Submit answer",

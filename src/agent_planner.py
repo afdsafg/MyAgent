@@ -39,7 +39,7 @@ PLANNER_SYSTEM_PROMPT = (
     "You make strategic decisions about where to navigate next.\n\n"
     "Available Actions:\n"
     "1. explore_panorama: Take an 8-view panorama to re-orient. Arguments: {}\n"
-    "2. navigate_to_object: Move toward a specific object using detector.\n"
+    "2. navigate_to_object: Navigate toward an object you can SEE in the current or recent view. Use only for objects you have visually detected nearby.\n"
     '   Arguments: {{"object_name": "oven", "view_idx": null}}\n'
     "3. explore_seed: Navigate to a seed viewpoint.\n"
     '   Arguments: {{"seed_id": "3"}}\n'
