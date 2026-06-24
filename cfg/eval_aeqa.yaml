@@ -79,7 +79,7 @@ planner:
     max_dilation_iter: 80
     stable_iou_threshold: 0.2
     close_iterations: 1
-    room_height: 1.5  # use 1.5m (not 1.8m) to avoid dining table splitting R2
+    room_height: 2.0  # use 2.0m for room segmentation envelope
 
 # about scene graph construction
 scene_graph:
