@@ -71,15 +71,14 @@ planner:
     visualize_on_topdown: true
     visualization_alpha: 0.35
     min_room_area: 16
-    observed_ratio_threshold: 0.0  # initial panorama: accept all rooms (0.0), later calls use 0.30
-    max_unobserved_room_hops: 99   # initial panorama: allow multi-hop, later calls use 1
+    observed_ratio_threshold: 0.30
+    max_unobserved_room_hops: 1
     room_adjacency_dilation: 1
     seed_area_min: 6
     seed_area_max: 400
     max_dilation_iter: 80
     stable_iou_threshold: 0.2
     close_iterations: 1
-    room_height: 1.5  # 1.5m clean room boundaries (above furniture, below ceiling)
 
 # about scene graph construction
 scene_graph:

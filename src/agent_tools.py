@@ -257,87 +257,21 @@ def observe_panorama(
         logging.warning(f"observe_panorama: grid refresh failed: {e}")
 
     # 直接调用 update_room_map（不依赖 update_frontier_map，因为后者
-    # 在 frontier 为空时会提前 return，跳过 room segmentation）
-    # 关键：Step 0 全景后大部分房间未充分观察（<30%），用配置的
-    # observed_ratio_threshold=0.30 会过滤掉所有未探索房间。
-    # 初始分割时强制用 0.0，接受所有房间（含 hypothesis）。
-    # 后续 update_frontier_map 调用会用品配置的 0.30 重新过滤。
+    # 初始房间分割：用 observed_ratio_threshold=0.0 接受所有房间
+    # （全景时大部分房间未充分探索，配置的 0.30 会过滤掉它们）。
+    # 使用 MSGNav-main (2) 的标准 update_room_map 路径，不做自构 envelope。
     try:
         from omegaconf import OmegaConf as _OC
-        import cv2 as _cv2
         room_cfg = tsdf_planner._cfg_get(cfg.planner, "room_segmentation", None)
         if room_cfg is not None:
             room_cfg_init = _OC.create(_OC.to_container(room_cfg))
             room_cfg_init.observed_ratio_threshold = 0.0
             room_cfg_init.max_unobserved_room_hops = 99
-        else:
-            room_cfg_init = cfg.planner
-
-        # Self-construct envelope at room_height (bypass get_island_around_pts
-        # which may use a different height). Per Obsidian notes v2 and
-        # diag_height.py: 1.5m finds 4 rooms, 1.8m finds 5 (with fragments).
-        room_height = float(tsdf_planner._cfg_get(room_cfg_init, "room_height", 1.5))
-        min_room_area = int(tsdf_planner._cfg_get(room_cfg_init, "min_room_area", 16))
-        seed_area_min = int(tsdf_planner._cfg_get(room_cfg_init, "seed_area_min", 6))
-        seed_area_max = int(tsdf_planner._cfg_get(room_cfg_init, "seed_area_max", 400))
-        max_dilation_iter = int(tsdf_planner._cfg_get(room_cfg_init, "max_dilation_iter", 80))
-        close_iterations = int(tsdf_planner._cfg_get(room_cfg_init, "close_iterations", 1))
-        stable_iou_threshold = float(tsdf_planner._cfg_get(room_cfg_init, "stable_iou_threshold", 0.2))
-
-        tsdf = tsdf_planner._tsdf_vol_cpu
-        voxel_size = tsdf_planner._voxel_size
-        min_height_voxel = tsdf_planner.min_height_voxel
-        hv = int(1.5 / voxel_size) + min_height_voxel  # 1.5m for clean room boundaries
-        envelope = tsdf[:, :, hv] > 0
-
-        if close_iterations > 0:
-            kernel = _cv2.getStructuringElement(_cv2.MORPH_CROSS, (3, 3))
-            envelope_u8 = (envelope.astype(np.uint8) * 255)
-            envelope = (_cv2.morphologyEx(envelope_u8, _cv2.MORPH_CLOSE, kernel,
-                         iterations=close_iterations) > 0) & envelope
-
-        if np.count_nonzero(envelope) >= min_room_area:
-            seeds = tsdf_planner._find_room_seed_masks(
-                envelope, min_area=seed_area_min, max_area=seed_area_max,
-                max_iterations=max_dilation_iter)
-            if len(seeds) == 0:
-                regions = tsdf_planner._connected_room_regions(envelope, min_room_area)
-            else:
-                regions = tsdf_planner._watershed_room_regions(envelope, seeds, min_room_area)
-
-            if len(regions) > 0:
-                # Skip _filter_room_regions_by_observed_adjacency for initial seg
-                tsdf_planner._commit_room_regions(
-                    regions, stable_iou_threshold, observed_threshold=0.0)
-                logging.info(f"observe_panorama: room_seg found {len(regions)} rooms "
-                            f"(envelope={np.count_nonzero(envelope)} voxels, h={room_height}m)")
+            tsdf_planner.update_room_map(cfg=room_cfg_init, pts=pts_normal)
+            logging.info(f"observe_panorama: room_seg found "
+                        f"{len(tsdf_planner.room_regions)} rooms")
     except Exception as e:
-        logging.warning(f"observe_panorama: room segmentation failed: {e}")
-        import traceback; traceback.print_exc()
-
-    # 也尝试 update_frontier_map（可能发现 frontier）
-    # 但注意：update_frontier_map 内部会调用 update_room_map 覆盖
-    # 我们的自构分割结果。所以先保存，调用后恢复。
-    _saved_room_map = tsdf_planner.room_map
-    _saved_room_regions = tsdf_planner.room_regions
-    try:
-        tsdf_planner.update_frontier_map(
-            pts, cfg.planner, scene, cnt_step,
-            save_frontier_image=False)
-        # update_frontier_map may have overwritten room_regions via its
-        # internal update_room_map call. Restore our self-constructed
-        # segmentation if it had more rooms.
-        if (len(tsdf_planner.room_regions) < len(_saved_room_regions)
-            and _saved_room_regions is not None):
-            tsdf_planner.room_map = _saved_room_map
-            tsdf_planner.room_regions = _saved_room_regions
-            logging.info(f"observe_panorama: restored {len(_saved_room_regions)} rooms "
-                        f"(update_frontier_map reduced to {len(tsdf_planner.room_regions)})")
-    except Exception as e:
-        logging.warning(f"observe_panorama: update_frontier_map failed: {e}")
-        # Restore on failure too
-        tsdf_planner.room_map = _saved_room_map
-        tsdf_planner.room_regions = _saved_room_regions
+        logging.warning(f"observe_panorama: room_seg failed: {e}")
 
     # 保存全景 8 张视角到 MemoryStore
     room_id = tsdf_planner.get_room_id_at(
