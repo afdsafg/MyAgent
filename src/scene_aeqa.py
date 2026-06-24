@@ -743,11 +743,10 @@ class Scene:
         ]
         obj_ids = [obj_id for obj_id in obj_ids if obj_id not in obj_exclude]
 
+        # Filter out obj_ids that no longer exist in self.objects
+        obj_ids = [oid for oid in obj_ids if oid in self.objects]
         obj_centers = np.zeros((len(obj_ids), 2))
         for i, obj_id in enumerate(obj_ids):
-            if obj_id not in self.objects:
-                obj_centers[i] = [float('nan'), float('nan')]
-                continue
             obj_centers[i] = self.objects[obj_id]["bbox"].center[[0, 2]]
 
         if len(obj_centers) == 0:
