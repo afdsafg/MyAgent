@@ -284,12 +284,21 @@ def navigate_to_object(
         max_nav = min(max_nav, max(1, step_budget))
         max_iter = min(max_iter, max(1, step_budget // 3))
 
-    new_pts, new_angle, success, status, _images = gd_nav(
+    new_pts, new_angle, success, status, _images, target_normal = gd_nav(
         scene, tsdf_planner, pts, angle, object_desc,
         max_consecutive_failures=5,
-        max_iterations=max_iter, converge_dist_voxels=5,
+        max_iterations=max_iter, converge_dist_voxels=12,
         max_nav_steps_per_iter=max_nav,
     )
+
+    # Arrival verification: if GD claims success, confirm agent is within 1.5m of target
+    if success and target_normal is not None:
+        from src.habitat import pos_normal_to_habitat
+        target_habitat = pos_normal_to_habitat(target_normal)
+        dist = np.linalg.norm(new_pts[:3] - target_habitat[:3])
+        if dist > 1.5:
+            success = False
+            status = f"Failed to reach target: {object_desc} (dist={dist:.1f}m)"
 
     # GD 导航完成后做一次静默感知并存档（plan：到达子目标后 3 视角观测）
     silent_perception_step(
