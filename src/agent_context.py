@@ -25,12 +25,19 @@ class ContextManager:
         self.current_stage = 0
         self.stage_messages = []
         self.stage_images = []
+        self.notebook = None  # EvidenceNotebook — persists across stages
 
-    def start_stage(self, stage_num: int):
-        """开始新阶段，清空阶段内上下文。"""
+    def start_stage(self, stage_num: int, notebook=None):
+        """开始新阶段。
+
+        Clears in-stage text/image context.  The EvidenceNotebook reference
+        is preserved across stages so the Planner can inject accumulated history.
+        """
         self.current_stage = stage_num
         self.stage_messages = []
         self.stage_images = []
+        if notebook is not None:
+            self.notebook = notebook
 
     def add_message(self, role: str, content: str):
         """记录阶段内消息。"""
