@@ -1,17 +1,12 @@
-"""Upper Planner: Qwen3.6-Plus API + 4-component structured prompt.
+"""Upper Planner: Structured prompt + mim-v2.5 API + action parsing."""
 
-The Planner takes structured scene/history/progress/actions info and produces
-a PlannerAction that the Executor carries out.
-"""
 from __future__ import annotations
 
 import json
 import logging
-import os
+import re
 from dataclasses import dataclass
 from typing import Optional
-
-import openai
 
 from src.const import (
     QWEN_PLANNER_API_KEY,
@@ -39,21 +34,31 @@ class PlannerAction:
 
 # ── System prompt ─────────────────────────────────────────────────────────
 
-PLANNER_SYSTEM_PROMPT = """\
-You are a high-level navigation planner for an embodied agent. \
-Your job is to decide what the agent should do next to find the answer to a question. \
-You receive structured information about what has been explored, what is currently visible, \
-and how much progress has been made. \
-You must output a JSON decision with a reason, action type, and confidence score. \
-Do NOT repeat actions that have already been tried with the same outcome. \
-Be strategic: use the History and Progress information to avoid redundant exploration.\
-"""
+PLANNER_SYSTEM_PROMPT = (
+    "You are an embodied AI agent exploring indoor scenes.\n"
+    "You make strategic decisions about where to navigate next.\n\n"
+    "Available Actions:\n"
+    "1. explore_panorama: Take an 8-view panorama to re-orient. Arguments: {}\n"
+    "2. navigate_to_object: Move toward a specific object using detector.\n"
+    '   Arguments: {{"object_name": "oven", "view_idx": null}}\n'
+    "3. explore_seed: Navigate to a seed viewpoint.\n"
+    '   Arguments: {{"seed_id": "3"}}\n'
+    "4. explore_frontier: Navigate to an unexplored frontier.\n"
+    '   Arguments: {{"frontier_id": "14"}}\n'
+    "5. inspect_object: Stay in place, closely examine an object.\n"
+    '   Arguments: {{"object_name": "oven"}}\n'
+    "6. submit_answer: Submit the final answer to the question.\n"
+    '   Arguments: {{"answer": "the towel is white"}}\n\n'
+    "Response Format:\n"
+    '{{"reasoning": "why this action", "action": "<action_name>", "arguments": {{...}}, "confidence": 0.8}}\n\n'
+    "Always output valid JSON. Only use actions from the list above."
+)
 
 
 # ── Planner class ─────────────────────────────────────────────────────────
 
 class Planner:
-    """Calls Qwen3.6-Plus (DashScope compatible-mode) and returns PlannerAction."""
+    """Calls mimo-v2.5 via proven call_vlm and returns PlannerAction."""
 
     def __init__(
         self,
@@ -74,7 +79,7 @@ class Planner:
         actions: str,
         image_b64: Optional[str] = None,
     ) -> PlannerAction:
-        """Call Qwen3.6-Plus with 4-component prompt, parse action."""
+        """Call VLM with 4-component prompt, parse action."""
         prompt = self.build_prompt(question, history, scene, progress, actions)
         messages = [{"role": "system", "content": PLANNER_SYSTEM_PROMPT}]
 
@@ -101,59 +106,57 @@ class Planner:
         history: str,
         scene: str,
         progress: str,
-        actions: str,
+        _actions: str,
     ) -> str:
-        """Build the 4-component prompt string sent to the VLM."""
+        """Build 4-component prompt with selected actions."""
         return (
-            f"You are a navigation agent. Given the information below, decide the next action.\n\n"
             f"Question: {question}\n\n"
             f"{history}\n\n"
             f"{scene}\n\n"
             f"{progress}\n\n"
-            f"{actions}\n\n"
-            f"Return ONLY a valid JSON object (no other text):\n"
-            f'{{"reason": "why this action", "action": "explore_panorama|navigate_to_object|explore_seed|explore_frontier|inspect_object|submit_answer", "confidence": 0.8, "object_name": null, "seed_id": null, "frontier_id": null, "view_idx": null, "answer": null}}'
+            "Decide the next action and respond with JSON."
         )
 
     def parse_response(self, response: str) -> PlannerAction:
-        """Parse VLM response — try JSON first, then keyword fallback."""
+        """Parse VLM response: try JSON first, then keyword fallback."""
         if not response:
-            return PlannerAction(action_type="explore_panorama", reason="Empty VLM response", confidence=0.0)
-        
-        import re
+            return PlannerAction(action_type="explore_panorama",
+                                reason="Empty VLM response", confidence=0.0)
+
         raw = response.strip()
-        
-        # Try simple { ... } extraction first
+
+        # Try code fence first
         data = None
-        if "{" in raw:
+        m = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', raw, re.DOTALL)
+        if m:
+            try:
+                data = json.loads(m.group(1).strip())
+            except json.JSONDecodeError:
+                pass
+
+        # Try raw { ... }
+        if data is None and "{" in raw:
             try:
                 start = raw.index("{")
                 end = raw.rindex("}") + 1
                 data = json.loads(raw[start:end])
             except (json.JSONDecodeError, ValueError):
                 pass
-        
-        # Try ```json ... ``` code fences
-        if data is None:
-            m = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', raw, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group(1).strip())
-                except json.JSONDecodeError:
-                    pass
-        
+
         if data is not None:
+            action_type = data.get("action", "explore_panorama")
+            args = data.get("arguments", {}) or {}
             return PlannerAction(
-                action_type=data.get("action", "explore_panorama"),
-                reason=data.get("reason", ""),
+                action_type=action_type,
+                reason=data.get("reasoning", data.get("reason", "")),
                 confidence=float(data.get("confidence", 0.5)),
-                object_name=data.get("object_name"),
-                seed_id=str(data["seed_id"]) if data.get("seed_id") is not None else None,
-                frontier_id=str(data["frontier_id"]) if data.get("frontier_id") is not None else None,
-                view_idx=data.get("view_idx"),
-                answer=data.get("answer"),
+                object_name=args.get("object_name") or data.get("object_name"),
+                seed_id=str(args["seed_id"]) if args.get("seed_id") is not None else str(data.get("seed_id")) if data.get("seed_id") is not None else None,
+                frontier_id=str(args.get("frontier_id")) if args.get("frontier_id") is not None else None,
+                view_idx=args.get("view_idx") or data.get("view_idx"),
+                answer=args.get("answer") or data.get("answer"),
             )
-        
+
         # Keyword fallback
         raw_l = raw.lower()
         for kw, action in [
@@ -165,29 +168,18 @@ class Planner:
         ]:
             if kw in raw_l:
                 if action == "submit_answer":
-                    # Try to extract answer from context
                     ans = raw.strip().split('\n')[-1][:300]
-                    return PlannerAction(action_type=action, answer=ans, reason="Inferred", confidence=0.5)
-                return PlannerAction(action_type=action, reason="Inferred", confidence=0.4,
+                    return PlannerAction(action_type=action, answer=ans,
+                                        reason="Inferred", confidence=0.5)
+                return PlannerAction(action_type=action, reason="Inferred",
+                                    confidence=0.4,
                                     object_name="oven" if action == "navigate_to_object" else None)
-        
+
         logger.info("Planner parse fallback, raw[:200]=%s", raw[:200])
-        return PlannerAction(action_type="explore_panorama", reason="Parse failed", confidence=0.0)
+        return PlannerAction(action_type="explore_panorama",
+                            reason="Parse failed", confidence=0.0)
 
     def _call_api(self, messages: list[dict]) -> str:
-        """Call API via requests (matches original call_vlm in agent_workflow.py)."""
-        import requests
-        payload = {"model": self.model_name, "messages": messages, "max_tokens": 1024, "temperature": 0.3}
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        try:
-            resp = requests.post(self.base_url, json=payload, headers=headers, timeout=180)
-        except Exception as e:
-            logger.error(f"Planner API error: {e}")
-            return ""
-        if resp.status_code != 200:
-            logger.error(f"Planner API error: {resp.status_code}")
-            return ""
-        data = resp.json()
-        msg = data.get("choices", [{}])[0].get("message", {})
-        # Try content, then reasoning_content (mimo-v2.5 reasoning model)
-        return msg.get("content") or msg.get("reasoning_content") or ""
+        """Use the proven call_vlm from agent_workflow (mimo-v2.5 compatible)."""
+        from src.agent_workflow import call_vlm
+        return call_vlm(messages, max_tokens=4096, temperature=0.3)
