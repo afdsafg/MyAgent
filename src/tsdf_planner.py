@@ -607,7 +607,7 @@ class TSDFPlanner(TSDFPlannerBase):
                     return False
 
             # Ensure target is at least 5 voxels (~0.5m) away from agent
-                        dist_to_agent = np.linalg.norm(next_point[:2].astype(float) - cur_point[:2].astype(float))
+            dist_to_agent = np.linalg.norm(next_point[:2].astype(float) - cur_point[:2].astype(float))
             while dist_to_agent < 5 and try_count < 1500:
                 next_point -= ft_direction
                 try_count += 1
@@ -615,7 +615,7 @@ class TSDFPlanner(TSDFPlannerBase):
                     or self.occupied[int(next_point[0]), int(next_point[1])]
                     or not self.island[int(next_point[0]), int(next_point[1])]):
                     continue
-                            dist_to_agent = np.linalg.norm(next_point[:2].astype(float) - cur_point[:2].astype(float))
+                dist_to_agent = np.linalg.norm(next_point[:2].astype(float) - cur_point[:2].astype(float))
             logging.info(f"  Frontier nav target: {next_point.astype(int)}, dist from agent: {dist_to_agent:.1f} voxels")
 
             self.target_point = next_point.astype(int)
