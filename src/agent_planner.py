@@ -120,6 +120,8 @@ class Planner:
 
     def parse_response(self, response: str) -> PlannerAction:
         """Parse VLM JSON response into a PlannerAction."""
+        if not response:
+            return PlannerAction(action_type="explore_panorama", reason="Empty VLM response", confidence=0.0)
         import re
         data = None
         raw = response.strip()
@@ -201,4 +203,5 @@ class Planner:
             return ""
 
         data = resp.json()
-        return data["choices"][0]["message"].get("content", "")
+        content = data.get("choices", [{}])[0].get("message", {}).get("content")
+        return content if content else ""
