@@ -184,8 +184,19 @@ class Planner:
                 temperature=0.3,
                 max_tokens=1024,
             )
-            content = response.choices[0].message.content
+            # Debug: inspect raw response
+            choice = response.choices[0]
+            msg = choice.message
+            content = msg.content
+            refusal = getattr(msg, 'refusal', None)
+            function_call = getattr(msg, 'function_call', None)
+            tool_calls = getattr(msg, 'tool_calls', None)
+            reasoning = getattr(msg, 'reasoning_content', None)
+            logger.info(f"VLM raw: content={repr(content)[:100]}, refusal={refusal}, fn_call={function_call}, reasoning={bool(reasoning)}")
+            if content is None and reasoning:
+                # Model returned reasoning but no explicit content
+                return reasoning
             return content if content else ""
         except Exception as e:
-            logger.error(f"Planner API error: {e}")
+            logger.error(f"Planner API error: {e}", exc_info=True)
             return ""
