@@ -18,7 +18,11 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict
 
 from src.agent_context import ContextManager
+from src.agent_evidence import TrajectoryEvidence
+from src.agent_executor import Executor
 from src.agent_memory import MemoryStore
+from src.agent_notebook import EvidenceNotebook
+from src.agent_planner import Planner, PLANNER_SYSTEM_PROMPT
 from src.agent_tools import (
     silent_perception_step,
     observe_panorama,
@@ -598,6 +602,268 @@ def run_episode(
                 pass
 
     return result
+
+
+# ── Two-Tier Planner-Executor Workflow ───────────────────────────────────
+
+def run_episode_two_tier(
+    scene_id: str,
+    question: str,
+    question_id: str,
+    cfg,
+    detection_model,
+    sam_predictor,
+    clip_model,
+    clip_preprocess,
+    clip_tokenizer,
+    output_dir: str = "/root/MyAgent/results/hmge",
+    max_planner_rounds: int = 10,
+    max_total_steps: int = 50,
+    start_pts: Optional[np.ndarray] = None,
+    start_angle: float = 0.0,
+) -> Dict:
+    """Two-tier Planner-Executor episode loop.
+
+    Returns: dict with keys:
+        scene_id, question_id, question, answer, success, steps_taken,
+        rounds_used, error
+    """
+    import habitat_sim
+    from src.scene_aeqa import Scene
+    from src.habitat import pos_normal_to_habitat
+    from src.tsdf_planner import TSDFPlanner
+    from src.const import QWEN_PLANNER_API_KEY, QWEN_PLANNER_BASE_URL
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    logger.info(f"=== Two-Tier Episode {question_id}: {scene_id} ===")
+    logger.info(f"Question: {question}")
+
+    result = {
+        "scene_id": scene_id,
+        "question_id": question_id,
+        "question": question,
+        "answer": "",
+        "success": False,
+        "steps_taken": 0,
+        "rounds_used": 0,
+        "error": "",
+    }
+
+    scene = None
+    tsdf_planner = None
+    notebook = EvidenceNotebook()
+    planner = Planner(api_key=QWEN_PLANNER_API_KEY, base_url=QWEN_PLANNER_BASE_URL)
+    executor = None
+
+    try:
+        from src.agent_tools import silent_perception_step
+        silent_perception_step._last_pos = None
+        silent_perception_step._step_counter = -1
+
+        import yaml
+        from omegaconf import OmegaConf, DictConfig
+
+        if isinstance(cfg, dict):
+            cfg = OmegaConf.create(cfg)
+        elif hasattr(cfg, "concept_graph_config_path"):
+            pass
+        else:
+            from easydict import EasyDict
+            cfg = EasyDict(cfg)
+
+        graph_cfg_path = getattr(cfg, "concept_graph_config_path", None)
+        if graph_cfg_path and os.path.exists(graph_cfg_path):
+            graph_cfg = OmegaConf.load(graph_cfg_path)
+            OmegaConf.resolve(graph_cfg)
+        else:
+            graph_cfg = getattr(cfg, "scene_graph", {})
+
+        scene = Scene(
+            scene_id=scene_id, cfg=cfg, graph_cfg=graph_cfg,
+            detection_model=detection_model, sam_predictor=sam_predictor,
+            clip_model=clip_model, clip_preprocess=clip_preprocess,
+            clip_tokenizer=clip_tokenizer,
+        )
+
+        if start_pts is not None and not np.isnan(start_pts).any():
+            pts = start_pts.copy()
+            angle = start_angle
+        else:
+            start_pts_random = scene.pathfinder.get_random_navigable_point()
+            if np.isnan(start_pts_random).any():
+                start_pts_random = np.array([0.0, 1.5, 0.0])
+            pts = start_pts_random.copy()
+            angle = 0.0
+
+        from src.geom import get_scene_bnds
+        vol_bnds, _ = get_scene_bnds(scene.pathfinder, floor_height=pts[1])
+        tsdf_planner = TSDFPlanner(
+            vol_bnds=vol_bnds,
+            voxel_size=cfg.tsdf_grid_size,
+            floor_height=pts[1],
+            floor_height_offset=0,
+            pts_init=pts,
+            init_clearance=cfg.init_clearance * 2,
+            save_visualization=False,
+        )
+
+        memory_store = MemoryStore(
+            output_dir=os.path.join(output_dir, f"memory_{question_id}")
+        )
+
+        executor = Executor(
+            scene, tsdf_planner, memory_store, cfg,
+            detection_model, sam_predictor,
+            clip_model, clip_preprocess, clip_tokenizer,
+        )
+        executor.set_state(pts, angle, 0)
+
+    except Exception as e:
+        logger.error(f"Two-tier initialization failed: {e}")
+        result["error"] = str(e)
+        return result
+
+    try:
+        # ── Step 1: Initial panorama ─────────────────────────────────
+        logger.info("--- Two-Tier Step 1: Initial Panorama ---")
+        evidence = executor.explore_panorama()
+        notebook.update_from_evidence(evidence, step=silent_perception_step._step_counter)
+
+        # ── Helper builders ──────────────────────────────────────────
+
+        def _build_scene_analysis() -> str:
+            lines = []
+            if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
+                lines.append("## Scene Analysis")
+                for room in tsdf_planner.room_regions:
+                    lines.append(
+                        f"- Room {room.room_id}: area={room.area:.0f}, "
+                        f"observed={room.observed_ratio:.0%}, "
+                        f"frontiers={getattr(room, 'frontier_ids', [])}"
+                    )
+            else:
+                lines.append("## Scene Analysis\nNo room segmentation available.")
+            return "\n".join(lines)
+
+        def _build_progress(round_num: int) -> str:
+            lines = [
+                "## Progress",
+                f"Target: {question}",
+                f"Round {round_num + 1} / {max_planner_rounds}",
+            ]
+            visited = notebook.get_visited_seeds() | notebook.get_visited_frontiers()
+            if visited:
+                lines.append(f"Already visited: {', '.join(sorted(visited))}")
+            return "\n".join(lines)
+
+        def _build_actions() -> str:
+            lines = ["## Actions"]
+            lines.append("1. explore_panorama")
+            lines.append("2. navigate_to_object <object_name>")
+            lines.append("3. explore_seed <seed_id>")
+            lines.append("4. explore_frontier <frontier_id>")
+            lines.append("5. inspect_object <object_name>")
+            lines.append("6. submit_answer <answer>")
+            visited_seeds = notebook.get_visited_seeds()
+            visited_frontiers = notebook.get_visited_frontiers()
+            if visited_seeds or visited_frontiers:
+                lines.append("")
+                if visited_seeds:
+                    lines.append(f"Exhausted seeds: {', '.join(sorted(visited_seeds))}")
+                if visited_frontiers:
+                    lines.append(f"Exhausted frontiers: {', '.join(sorted(visited_frontiers))}")
+            return "\n".join(lines)
+
+        # ── Planner-Executor loop ────────────────────────────────────
+        for round_num in range(max_planner_rounds):
+            rounds_used = round_num + 1
+
+            # Build 4-component prompt
+            history = notebook.get_injection_text()
+            scene_analysis = _build_scene_analysis()
+            progress = _build_progress(round_num)
+            actions = _build_actions()
+
+            # Last evidence key frame as image (if any)
+            image_b64 = (
+                evidence.key_frames[-1]
+                if evidence and evidence.key_frames
+                else None
+            )
+
+            # Planner decides
+            action = planner.decide(
+                question=question,
+                history=history,
+                scene=scene_analysis,
+                progress=progress,
+                actions=actions,
+                image_b64=image_b64,
+            )
+            logger.info(
+                "Round %d: action=%s confidence=%.2f reason=%s",
+                rounds_used, action.action_type, action.confidence, action.reason,
+            )
+
+            # Check submit_answer
+            if action.action_type == "submit_answer":
+                result["answer"] = action.answer or ""
+                result["success"] = True
+                result["steps_taken"] = silent_perception_step._step_counter
+                result["rounds_used"] = rounds_used
+                logger.info(f"Answer submitted at round {rounds_used}: {result['answer']}")
+                return result
+
+            # Executor executes
+            evidence = executor.execute_action(action)
+            current_step = silent_perception_step._step_counter
+            notebook.update_from_evidence(evidence, step=current_step)
+
+            # Loop detection: force switch if entity exhausted
+            exhausted_id = (
+                action.seed_id
+                or action.frontier_id
+                or ""
+            )
+            if exhausted_id and notebook.is_exhausted(exhausted_id):
+                logger.info(f"Entity {exhausted_id} exhausted — forcing strategy switch next round.")
+                continue
+
+            # Step budget check
+            if silent_perception_step._step_counter >= max_total_steps:
+                logger.info("Step budget exhausted.")
+                break
+
+        # ── Fallback: submit best guess ──────────────────────────────
+        logger.info("Budget exhausted — fallback: submit best guess.")
+        fallback_action = planner.decide(
+            question=question,
+            history=notebook.get_injection_text(),
+            scene="## Scene Analysis\n(No current observation — budget exhausted)",
+            progress="## Progress\nAll rounds used. Submit your best answer now.",
+            actions="## Actions\n6. submit_answer <your_best_guess>",
+            image_b64=None,
+        )
+        result["answer"] = fallback_action.answer or "unanswerable"
+        result["success"] = "unanswerable" not in result["answer"].lower()
+        result["steps_taken"] = silent_perception_step._step_counter
+        result["rounds_used"] = max_planner_rounds
+        return result
+
+    except Exception as e:
+        logger.error(f"Two-tier workflow error: {e}")
+        import traceback
+        traceback.print_exc()
+        result["error"] = str(e)
+        return result
+
+    finally:
+        if scene is not None:
+            try:
+                scene.__del__()
+            except Exception:
+                pass
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
