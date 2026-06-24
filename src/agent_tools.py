@@ -9,6 +9,22 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+# ── 全景配置 ──────────────────────────────────────────────────────────────
+
+VIEW_LABELS = [
+    "Front", "Front-Right", "Right", "Back-Right",
+    "Back", "Back-Left", "Left", "Front-Left",
+]
+
+
+def observe_panorama_config() -> dict:
+    """Return configuration dict for panorama observation."""
+    return {
+        "view_count": 8,
+        "resolution": 400,
+        "view_labels": list(VIEW_LABELS),
+    }
+
 
 # ── 每 step 静默感知 ────────────────────────────────────────────────────
 
@@ -167,16 +183,23 @@ def observe_panorama(
     memory_store, cam_intr, cfg, detection_model,
     sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
 ) -> Tuple[np.ndarray, np.ndarray, str, str]:
-    """7 视角全景观测，返回 (pts, angle, mosaic_b64, text)。
+    """8 视角全景观测，返回 (pts, angle, mosaic_b64, text)。
 
-    7 个视角均匀覆盖 360°（endpoint=False 避免首尾重叠）。
+    8 个视角均匀覆盖 360°（endpoint=False 避免首尾重叠）。
     """
     from src.agent_image_utils import make_mosaic, numpy_to_base64
 
-    angles = np.linspace(-np.pi, np.pi, 7, endpoint=False)
+    config = observe_panorama_config()
+    n_views = config["view_count"]
+    target_h = config["resolution"]
+    view_labels = config["view_labels"]
+
+    angles = np.linspace(-np.pi, np.pi, n_views, endpoint=False)
     views = []
+    cam_poses = []
     for ang in angles:
-        obs, _ = scene.get_observation(pts, ang)
+        obs, cam_pose = scene.get_observation(pts, ang)
+        cam_poses.append(cam_pose)
         views.append(obs["color_sensor"][..., :3])
 
     # 静默执行感知（3视角 + TSDF + 场景图更新；snapshot 由下方 7 视角存档）
@@ -187,11 +210,11 @@ def observe_panorama(
         skip_snapshots=True,
     )
 
-    # 保存全景 7 张视角到 MemoryStore
+    # 保存全景视角到 MemoryStore
     room_id = tsdf_planner.get_room_id_at(
         tsdf_planner.habitat2voxel(pts)[:2])
     step_id = silent_perception_step._step_counter
-    for ang_idx, view_rgb in enumerate(views):
+    for ang_idx, (view_rgb, label) in enumerate(zip(views, view_labels)):
         objs_in_view = [
             scene.objects[oid]["class_name"]
             for oid in scene.objects
@@ -200,7 +223,7 @@ def observe_panorama(
             ) < cfg.scene_graph.obj_include_dist + 0.5
         ]
         memory_store.add_snapshot(
-            snapshot_id=f"step{step_id}_pano_view{ang_idx}",
+            snapshot_id=f"step{step_id}_pano_{label}",
             image=view_rgb,
             room_id=room_id,
             objects_in_view=objs_in_view,
@@ -214,7 +237,7 @@ def observe_panorama(
     tsdf_planner.update_frontier_map(
         pts, cfg.planner, scene, cnt_step, save_frontier_image=False)
 
-    mosaic = make_mosaic(views, target_h=200)
+    mosaic = make_mosaic(views, target_h=400)
     mosaic_b64 = numpy_to_base64(mosaic)
 
     room_info = ""
