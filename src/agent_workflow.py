@@ -18,7 +18,11 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict
 
 from src.agent_context import ContextManager
+from src.agent_evidence import TrajectoryEvidence
+from src.agent_executor import Executor
 from src.agent_memory import MemoryStore
+from src.agent_notebook import EvidenceNotebook
+from src.agent_planner import Planner, PLANNER_SYSTEM_PROMPT
 from src.agent_tools import (
     silent_perception_step,
     observe_panorama,
@@ -880,6 +884,440 @@ def _parse_vlm_response(response: str) -> dict:
         parsed["tool"] = parsed.get("action", "")
 
     return parsed
+
+
+# ── Direct Run (for testing) ────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--scene", type=str, required=True)
+    parser.add_argument("--question", type=str, required=True)
+    parser.add_argument("--cfg", type=str,
+                       default="cfg/eval_aeqa.yaml")
+    parser.add_argument("--output", type=str,
+                       default="/root/MyAgent/results/hmge")
+    args = parser.parse_args()
+
+    # Load config
+    import yaml
+    from omegaconf import OmegaConf
+    from src.utils import get_pts_angle_aeqa
+
+    with open(args.cfg, "r") as f:
+        cfg = OmegaConf.create(yaml.safe_load(f))
+    OmegaConf.resolve(cfg)
+
+    # Look up AEQA start position for this scene+question
+    start_pts = None
+    start_angle = 0.0
+    try:
+        questions_list = json.load(open(cfg.questions_list_path, "r"))
+        for qd in questions_list:
+            if qd["episode_history"] == args.scene and qd["question"] == args.question:
+                start_pts, start_angle = get_pts_angle_aeqa(
+                    qd["position"], qd["rotation"])
+                logging.info(f"AEQA start position: {start_pts}, angle: {start_angle}")
+                break
+    except Exception as e:
+        logging.warning(f"Could not find AEQA start position: {e}")
+
+    # Load models (same as run_aeqa_evaluation.py)
+    from ultralytics import SAM, YOLOWorld
+    import open_clip
+
+    detection_model = YOLOWorld(cfg.yolo_model_name)
+    sam_predictor = SAM(cfg.sam_model_name)
+    clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
+        "ViT-B-32", "laion2b_s34b_b79k")
+    clip_tokenizer = open_clip.get_tokenizer("ViT-B-32")
+
+    result = run_episode(
+        scene_id=args.scene,
+        question=args.question,
+        question_id="test",
+        cfg=cfg,
+        detection_model=detection_model,
+        sam_predictor=sam_predictor,
+        clip_model=clip_model,
+        clip_preprocess=clip_preprocess,
+        clip_tokenizer=clip_tokenizer,
+        output_dir=args.output,
+        start_pts=start_pts,
+        start_angle=start_angle,
+    )
+
+    print(json.dumps(result, indent=2))
+def run_episode_two_tier(
+    scene_id: str,
+    question: str,
+    question_id: str,
+    cfg,
+    detection_model,
+    sam_predictor,
+    clip_model,
+    clip_preprocess,
+    clip_tokenizer,
+    output_dir: str = "/root/MyAgent/results/hmge",
+    max_planner_rounds: int = 10,
+    max_total_steps: int = 50,
+    start_pts: Optional[np.ndarray] = None,
+    start_angle: float = 0.0,
+) -> Dict:
+    """Two-tier Planner-Executor episode loop.
+
+    Returns: dict with keys:
+        scene_id, question_id, question, answer, success, steps_taken,
+        rounds_used, error
+    """
+    import habitat_sim
+    from src.scene_aeqa import Scene
+    from src.habitat import pos_normal_to_habitat
+    from src.tsdf_planner import TSDFPlanner
+    from src.const import QWEN_PLANNER_API_KEY, QWEN_PLANNER_BASE_URL
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    logger.info(f"=== Two-Tier Episode {question_id}: {scene_id} ===")
+    logger.info(f"Question: {question}")
+
+    result = {
+        "scene_id": scene_id,
+        "question_id": question_id,
+        "question": question,
+        "answer": "",
+        "success": False,
+        "steps_taken": 0,
+        "rounds_used": 0,
+        "error": "",
+    }
+
+    scene = None
+    tsdf_planner = None
+    notebook = EvidenceNotebook()
+    planner = Planner(api_key=QWEN_PLANNER_API_KEY, base_url=QWEN_PLANNER_BASE_URL)
+    executor = None
+
+    try:
+        from src.agent_tools import silent_perception_step
+        silent_perception_step._last_pos = None
+        silent_perception_step._step_counter = -1
+
+        import yaml
+        from omegaconf import OmegaConf, DictConfig
+
+        if isinstance(cfg, dict):
+            cfg = OmegaConf.create(cfg)
+        elif hasattr(cfg, "concept_graph_config_path"):
+            pass
+        else:
+            from easydict import EasyDict
+            cfg = EasyDict(cfg)
+
+        graph_cfg_path = getattr(cfg, "concept_graph_config_path", None)
+        if graph_cfg_path and os.path.exists(graph_cfg_path):
+            graph_cfg = OmegaConf.load(graph_cfg_path)
+            OmegaConf.resolve(graph_cfg)
+        else:
+            graph_cfg = getattr(cfg, "scene_graph", {})
+
+        scene = Scene(
+            scene_id=scene_id, cfg=cfg, graph_cfg=graph_cfg,
+            detection_model=detection_model, sam_predictor=sam_predictor,
+            clip_model=clip_model, clip_preprocess=clip_preprocess,
+            clip_tokenizer=clip_tokenizer,
+        )
+
+        if start_pts is not None and not np.isnan(start_pts).any():
+            pts = start_pts.copy()
+            angle = start_angle
+        else:
+            start_pts_random = scene.pathfinder.get_random_navigable_point()
+            if np.isnan(start_pts_random).any():
+                start_pts_random = np.array([0.0, 1.5, 0.0])
+            pts = start_pts_random.copy()
+            angle = 0.0
+
+        from src.geom import get_scene_bnds
+        vol_bnds, _ = get_scene_bnds(scene.pathfinder, floor_height=pts[1])
+        tsdf_planner = TSDFPlanner(
+            vol_bnds=vol_bnds,
+            voxel_size=cfg.tsdf_grid_size,
+            floor_height=pts[1],
+            floor_height_offset=0,
+            pts_init=pts,
+            init_clearance=cfg.init_clearance * 2,
+            save_visualization=False,
+        )
+
+        memory_store = MemoryStore(
+            output_dir=os.path.join(output_dir, f"memory_{question_id}")
+        )
+
+        executor = Executor(
+            scene, tsdf_planner, memory_store, cfg,
+            detection_model, sam_predictor,
+            clip_model, clip_preprocess, clip_tokenizer,
+        )
+        executor.set_state(pts, angle, 0)
+
+    except Exception as e:
+        logger.error(f"Two-tier initialization failed: {e}")
+        result["error"] = str(e)
+        return result
+
+    try:
+        # ── Step 1: Initial panorama ─────────────────────────────────
+        logger.info("--- Two-Tier Step 1: Initial Panorama ---")
+        evidence = executor.explore_panorama()
+        notebook.update_from_evidence(evidence, step=silent_perception_step._step_counter)
+
+        # ── Helper builders ──────────────────────────────────────────
+
+        def _build_scene_analysis() -> str:
+            lines = []
+            if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
+                lines.append("## Scene Analysis")
+                for room in tsdf_planner.room_regions:
+                    lines.append(
+                        f"- Room {room.room_id}: area={room.area:.0f}, "
+                        f"observed={room.observed_ratio:.0%}, "
+                        f"frontiers={getattr(room, 'frontier_ids', [])}"
+                    )
+            else:
+                lines.append("## Scene Analysis\nNo room segmentation available.")
+            return "\n".join(lines)
+
+        def _build_progress(round_num: int) -> str:
+            lines = [
+                "## Progress",
+                f"Target: {question}",
+                f"Round {round_num + 1} / {max_planner_rounds}",
+            ]
+            visited = notebook.get_visited_seeds() | notebook.get_visited_frontiers()
+            if visited:
+                lines.append(f"Already visited: {', '.join(sorted(visited))}")
+            return "\n".join(lines)
+
+        def _build_actions() -> str:
+            lines = ["## Actions"]
+            lines.append("1. explore_panorama")
+            lines.append("2. navigate_to_object <object_name>")
+            lines.append("3. explore_seed <seed_id>")
+            lines.append("4. explore_frontier <frontier_id>")
+            lines.append("5. inspect_object <object_name>")
+            lines.append("6. submit_answer <answer>")
+            visited_seeds = notebook.get_visited_seeds()
+            visited_frontiers = notebook.get_visited_frontiers()
+            if visited_seeds or visited_frontiers:
+                lines.append("")
+                if visited_seeds:
+                    lines.append(f"Exhausted seeds: {', '.join(sorted(visited_seeds))}")
+                if visited_frontiers:
+                    lines.append(f"Exhausted frontiers: {', '.join(sorted(visited_frontiers))}")
+            return "\n".join(lines)
+
+        # ── Planner-Executor loop ────────────────────────────────────
+        for round_num in range(max_planner_rounds):
+            rounds_used = round_num + 1
+
+            # Build 4-component prompt
+            history = notebook.get_injection_text()
+            scene_analysis = _build_scene_analysis()
+            progress = _build_progress(round_num)
+            actions = _build_actions()
+
+            # Last evidence key frame as image (if any)
+            image_b64 = (
+                evidence.key_frames[-1]
+                if evidence and evidence.key_frames
+                else None
+            )
+
+            # Planner decides
+            action = planner.decide(
+                question=question,
+                history=history,
+                scene=scene_analysis,
+                progress=progress,
+                actions=actions,
+                image_b64=image_b64,
+            )
+            logger.info(
+                "Round %d: action=%s confidence=%.2f reason=%s",
+                rounds_used, action.action_type, action.confidence, action.reason,
+            )
+
+            # Check submit_answer
+            if action.action_type == "submit_answer":
+                result["answer"] = action.answer or ""
+                result["success"] = True
+                result["steps_taken"] = silent_perception_step._step_counter
+                result["rounds_used"] = rounds_used
+                logger.info(f"Answer submitted at round {rounds_used}: {result['answer']}")
+                return result
+
+            # Executor executes
+            evidence = executor.execute_action(action)
+            current_step = silent_perception_step._step_counter
+            notebook.update_from_evidence(evidence, step=current_step)
+
+            # Loop detection: force switch if entity exhausted
+            exhausted_id = (
+                action.seed_id
+                or action.frontier_id
+                or ""
+            )
+            if exhausted_id and notebook.is_exhausted(exhausted_id):
+                logger.info(f"Entity {exhausted_id} exhausted — forcing strategy switch next round.")
+                continue
+
+            # Step budget check
+            if silent_perception_step._step_counter >= max_total_steps:
+                logger.info("Step budget exhausted.")
+                break
+
+        # ── Fallback: submit best guess ──────────────────────────────
+        logger.info("Budget exhausted — fallback: submit best guess.")
+        fallback_action = planner.decide(
+            question=question,
+            history=notebook.get_injection_text(),
+            scene="## Scene Analysis\n(No current observation — budget exhausted)",
+            progress="## Progress\nAll rounds used. Submit your best answer now.",
+            actions="## Actions\n6. submit_answer <your_best_guess>",
+            image_b64=None,
+        )
+        result["answer"] = fallback_action.answer or "unanswerable"
+        result["success"] = "unanswerable" not in result["answer"].lower()
+        result["steps_taken"] = silent_perception_step._step_counter
+        result["rounds_used"] = max_planner_rounds
+        return result
+
+    except Exception as e:
+        logger.error(f"Two-tier workflow error: {e}")
+        import traceback
+        traceback.print_exc()
+        result["error"] = str(e)
+        return result
+
+    finally:
+        if scene is not None:
+            try:
+                scene.__del__()
+            except Exception:
+                pass
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+# Invalid arguments for navigate_to_object — these are not object descriptions
+_NAV_OBJ_INVALID = {
+    "", "forward", "backward", "left", "right", "up", "down",
+    "explore", "navigate", "search", "look", "go", "move",
+    "room", "room 0", "room 1", "room 2", "room 3", "room 4",
+    "frontier", "frontier 0", "frontier 1", "frontier 2",
+    "yes", "no", "true", "false", "none", "null",
+    "the kitchen", "the bathroom", "the bedroom", "the living room",
+    "kitchen", "bathroom", "bedroom", "living room",
+}
+
+def _is_valid_object_desc(desc: str) -> bool:
+    """Check if a string is a valid concrete object description for GroundingDINO.
+
+    Rejects empty strings, directions, room names, and other non-object terms.
+    """
+    if not desc or not isinstance(desc, str):
+        return False
+    desc_clean = desc.strip().lower()
+    if desc_clean in _NAV_OBJ_INVALID:
+        return False
+    if len(desc_clean) < 2:
+        return False
+    # Reject pure numbers (room/frontier IDs)
+    try:
+        int(desc_clean)
+        return False
+    except ValueError:
+        pass
+    return True
+
+
+def _build_messages(context: ContextManager) -> List[dict]:
+    """Build the message list for VLM from context manager state."""
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+    # Add stage transition summaries from previous stages
+    for transition in context.transitions:
+        if transition.from_stage != context.current_stage:
+            summary_text = (
+                f"[Stage {transition.from_stage}→{transition.to_stage} summary]\n"
+                f"{transition.summary}"
+            )
+            messages.append({"role": "assistant", "content": summary_text})
+
+    # Add current stage messages
+    messages.extend(context.stage_messages)
+
+    return messages
+
+
+def _format_rooms_info(tsdf_planner) -> str:
+    """Format room information for VLM prompt."""
+    if not hasattr(tsdf_planner, "room_regions") or not tsdf_planner.room_regions:
+        return "No room segmentation available."
+
+    lines = []
+    for room in tsdf_planner.room_regions:
+        lines.append(
+            f"  Room {room.room_id}: area={room.area}, "
+            f"state={room.room_state}, "
+            f"observed={room.observed_ratio:.1%}, "
+            f"frontiers={room.frontier_ids}"
+        )
+    return "Rooms:\n" + "\n".join(lines) if lines else "No rooms."
+
+
+def _format_frontiers_info(tsdf_planner) -> str:
+    """Format frontier information for VLM prompt."""
+    if not tsdf_planner.frontiers:
+        return "No frontiers available."
+
+    lines = []
+    for ft in tsdf_planner.frontiers:
+        room_str = f"room={ft.room_id}" if hasattr(ft, "room_id") and ft.room_id >= 0 else ""
+        lines.append(f"  Frontier {ft.frontier_id}: {room_str}")
+    return "Frontiers:\n" + "\n".join(lines) if lines else "No frontiers."
+
+
+def _parse_vlm_response(response: str) -> dict:
+    """Parse VLM JSON response."""
+    if response is None:
+        response = ""
+    try:
+        # Try to find JSON block
+        if "```" in response:
+            # Extract content between first ``` and last ```
+            parts = response.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:]
+                try:
+                    return json.loads(part.strip())
+                except json.JSONDecodeError:
+                    continue
+
+        # Try direct JSON parse
+        return json.loads(response.strip())
+    except (json.JSONDecodeError, Exception) as e:
+        logger.warning(f"Failed to parse VLM response as JSON: {e}")
+        return {
+            "reasoning": response[:200],
+            "tool": "unknown",
+            "arguments": "",
+            "answer": "",
+        }
 
 
 # ── Direct Run (for testing) ────────────────────────────────────────────
