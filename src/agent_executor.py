@@ -114,6 +114,9 @@ class Executor:
             self.tsdf,
             self._pts,
             self._angle,
+            view_idx,       # VLM-selected view_idx (None = GD auto-scan)
+            None,           # view_angle (None = use current angle)
+            None,           # view_cam_pose (None = use current cam_pose)
             object_name,
             self.memory,
             self.scene.cam_intrinsic,
