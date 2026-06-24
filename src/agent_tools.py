@@ -112,7 +112,7 @@ def _navigate_to_target_with_agent_step(
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
     seed_view_manager=None, active_seed_ids=None,
-    run_logger=None,
+    run_logger=None, target_type=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, int]:
     """循环调用 set_next_navigation_point + agent_step 直到抵达目标。
 
@@ -129,6 +129,7 @@ def _navigate_to_target_with_agent_step(
     success = tsdf_planner.set_next_navigation_point(
         choice=choice, pts=pts, objects=scene.objects,
         cfg=cfg.planner, pathfinder=scene.pathfinder,
+        target_type=target_type,
     )
     if not success:
         return pts, angle, False, "Failed to set navigation target", 0
