@@ -123,6 +123,7 @@ class Planner:
             return PlannerAction(action_type="explore_panorama",
                                 reason="Empty VLM response", confidence=0.0)
 
+        import re
         raw = response.strip()
 
         # Try code fence first
@@ -158,7 +159,6 @@ class Planner:
             )
 
         # Keyword fallback with ID extraction
-        import re
         raw_l = raw.lower()
         for kw, action in [
             ("submit_answer", "submit_answer"),
