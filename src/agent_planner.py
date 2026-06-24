@@ -11,8 +11,6 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-import requests
-
 import openai
 
 from src.const import (
@@ -107,101 +105,89 @@ class Planner:
     ) -> str:
         """Build the 4-component prompt string sent to the VLM."""
         return (
-            f"Answer this embodied question by navigating to find the answer.\n\n"
+            f"You are a navigation agent. Given the information below, decide the next action.\n\n"
             f"Question: {question}\n\n"
             f"{history}\n\n"
             f"{scene}\n\n"
             f"{progress}\n\n"
             f"{actions}\n\n"
-            "Think step by step about what to do next. "
-            "Then on the FINAL LINE ONLY, output a JSON object with these fields:\n"
-            '{"reason": "...", "action": "...", "confidence": 0.0-1.0'
-            ', "object_name": "...", "seed_id": "N", "frontier_id": "N", "view_idx": N, "answer": "..."}'
+            f"Return ONLY a valid JSON object (no other text):\n"
+            f'{{"reason": "why this action", "action": "explore_panorama|navigate_to_object|explore_seed|explore_frontier|inspect_object|submit_answer", "confidence": 0.8, "object_name": null, "seed_id": null, "frontier_id": null, "view_idx": null, "answer": null}}'
         )
 
     def parse_response(self, response: str) -> PlannerAction:
-        """Parse VLM response (may contain reasoning + final JSON)."""
+        """Parse VLM response — try JSON first, then keyword fallback."""
         if not response:
             return PlannerAction(action_type="explore_panorama", reason="Empty VLM response", confidence=0.0)
+        
         import re
         raw = response.strip()
-
-        # Try to find ALL JSON objects, use the LAST one (after reasoning)
-        json_objects = []
-        for m in re.finditer(r'\{[^{}]*\}', raw):
+        
+        # Try simple { ... } extraction first
+        data = None
+        if "{" in raw:
             try:
-                json_objects.append(json.loads(m.group()))
-            except json.JSONDecodeError:
+                start = raw.index("{")
+                end = raw.rindex("}") + 1
+                data = json.loads(raw[start:end])
+            except (json.JSONDecodeError, ValueError):
                 pass
-
-        # Also try code fences
-        for m in re.finditer(r'```(?:json)?\s*\n?(.*?)\n?\s*```', raw, re.DOTALL):
-            try:
-                json_objects.append(json.loads(m.group(1).strip()))
-            except json.JSONDecodeError:
-                pass
-
-        if json_objects:
-            data = json_objects[-1]  # Last JSON object is the action
+        
+        # Try ```json ... ``` code fences
+        if data is None:
+            m = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', raw, re.DOTALL)
+            if m:
+                try:
+                    data = json.loads(m.group(1).strip())
+                except json.JSONDecodeError:
+                    pass
+        
+        if data is not None:
             return PlannerAction(
                 action_type=data.get("action", "explore_panorama"),
                 reason=data.get("reason", ""),
                 confidence=float(data.get("confidence", 0.5)),
                 object_name=data.get("object_name"),
-                seed_id=str(data.get("seed_id")) if data.get("seed_id") is not None else None,
-                frontier_id=str(data.get("frontier_id")) if data.get("frontier_id") is not None else None,
+                seed_id=str(data["seed_id"]) if data.get("seed_id") is not None else None,
+                frontier_id=str(data["frontier_id"]) if data.get("frontier_id") is not None else None,
                 view_idx=data.get("view_idx"),
                 answer=data.get("answer"),
             )
-
-        # Fallback: keyword-based — but only if no JSON found at all
-        raw_l = raw.lower()
-        # Check if the model gave a clear final answer (last lines of reasoning)
-        last_lines = raw.strip().split('\n')[-5:]
-        last_text = ' '.join(last_lines).lower()
         
-        if "submit_answer" in last_text or "final answer" in last_text:
-            # Extract answer from last sentence
-            for line in reversed(last_lines):
-                if 'answer' in line.lower():
-                    return PlannerAction(action_type="submit_answer", answer=line.strip()[:300],
-                                        reason="Inferred from final lines", confidence=0.5)
-            return PlannerAction(action_type="submit_answer", answer=last_lines[-1][:300],
-                                reason="Inferred final line", confidence=0.5)
-        if "navigate_to_object" in last_text:
-            return PlannerAction(action_type="navigate_to_object", reason="Inferred", confidence=0.4, object_name="oven")
-        if "explore_seed" in last_text:
-            return PlannerAction(action_type="explore_seed", reason="Inferred", confidence=0.4)
-        if "explore_frontier" in last_text:
-            return PlannerAction(action_type="explore_frontier", reason="Inferred", confidence=0.4)
-        if "explore_panorama" in last_text:
-            return PlannerAction(action_type="explore_panorama", reason="Inferred", confidence=0.4)
-
-        logger.debug("Planner parse failed, raw first 300 chars: %s", raw[:300])
+        # Keyword fallback
+        raw_l = raw.lower()
+        for kw, action in [
+            ("submit_answer", "submit_answer"),
+            ("navigate_to_object", "navigate_to_object"),
+            ("explore_seed", "explore_seed"),
+            ("explore_frontier", "explore_frontier"),
+            ("explore_panorama", "explore_panorama"),
+        ]:
+            if kw in raw_l:
+                if action == "submit_answer":
+                    # Try to extract answer from context
+                    ans = raw.strip().split('\n')[-1][:300]
+                    return PlannerAction(action_type=action, answer=ans, reason="Inferred", confidence=0.5)
+                return PlannerAction(action_type=action, reason="Inferred", confidence=0.4,
+                                    object_name="oven" if action == "navigate_to_object" else None)
+        
+        logger.info("Planner parse fallback, raw[:200]=%s", raw[:200])
         return PlannerAction(action_type="explore_panorama", reason="Parse failed", confidence=0.0)
 
     def _call_api(self, messages: list[dict]) -> str:
-        """Call mimo-v2.5 API — handles both content and reasoning_content."""
-        import openai
-        client = openai.OpenAI(
-            api_key=self.api_key,
-            base_url="https://opencode.ai/zen/go/v1",
-        )
+        """Call API via requests (matches original call_vlm in agent_workflow.py)."""
+        import requests
+        payload = {"model": self.model_name, "messages": messages, "max_tokens": 1024, "temperature": 0.3}
+        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
         try:
-            response = client.chat.completions.create(
-                model=self.model_name,
-                messages=messages,
-                temperature=0.3,
-                max_tokens=1024,
-            )
-            # mimo-v2.5 returns reasoning_content; check both fields
-            msg = response.choices[0].message
-            content = msg.content
-            reasoning = getattr(msg, 'reasoning_content', None)
-            
-            # Prefer reasoning_content if content is empty (mimo-v2.5 reasoning model)
-            result = content or reasoning or ""
-            return result
+            resp = requests.post(self.base_url, json=payload, headers=headers, timeout=180)
         except Exception as e:
-            logger.error(f"Planner API error: {e}", exc_info=True)
+            logger.error(f"Planner API error: {e}")
             return ""
+        if resp.status_code != 200:
+            logger.error(f"Planner API error: {resp.status_code}")
+            return ""
+        data = resp.json()
+        msg = data.get("choices", [{}])[0].get("message", {})
+        # Try content, then reasoning_content (mimo-v2.5 reasoning model)
+        return msg.get("content") or msg.get("reasoning_content") or ""
