@@ -493,7 +493,15 @@ def run_episode(
             elif current_stage == "2.5a":
                 # ── Stage 2.5a: Seed Selection (VLM call 2) ──
                 logger.info("--- Stage 2.5a: Seed Selection ---")
+                # Filter: only show seeds whose rooms are NOT well-explored
+                # A room is "explored" if observed_ratio >= 0.30
                 explored_seed_ids = set()
+                EXPLORED_THRESHOLD = 0.30
+                for room in tsdf_planner.room_regions:
+                    if (hasattr(room, 'observed_ratio') and
+                        room.observed_ratio >= EXPLORED_THRESHOLD):
+                        explored_seed_ids.add(room.room_id)
+                logger.info(f"Stage 2.5a: explored_seed_ids={explored_seed_ids}")
                 seed_ids = seed_view_manager.get_unexplored_seed_ids(explored_seed_ids)
 
                 if not seed_ids:
