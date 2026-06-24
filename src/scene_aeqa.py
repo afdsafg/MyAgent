@@ -982,6 +982,30 @@ def _load_gd_model(gd_dir=None, device="cuda"):
     return _gd_model, _gd_transform
 
 
+def gd_quality_filter(bbox, score, image_shape, max_bbox_ratio=0.30, min_score=0.35):
+    """Filter GD detections by bbox area ratio and confidence score.
+
+    Args:
+        bbox: [x1, y1, x2, y2] detection box
+        score: detection confidence
+        image_shape: (height, width) of the image
+        max_bbox_ratio: maximum bbox area / image area ratio (default 0.30)
+        min_score: minimum confidence score (default 0.35)
+
+    Returns:
+        (bbox, "ok") if quality passes, (None, reason) if rejected
+    """
+    bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+    image_area = image_shape[0] * image_shape[1]
+    ratio = bbox_area / image_area
+
+    if ratio > max_bbox_ratio:
+        return None, "bbox_too_large"
+    if score < min_score:
+        return None, "score_too_low"
+    return bbox, "ok"
+
+
 def _gd_detect(rgb, prompt, box_threshold=0.30, text_threshold=0.25):
     """Run GroundingDINO on a single RGB image.
 
@@ -1022,7 +1046,7 @@ def grounded_navigate_to_object(
     scene, tsdf_planner, pts, angle, object_desc,
     max_steps=20, gd_dir=None,
     max_consecutive_failures=5,
-    max_iterations=5, converge_dist_voxels=5,
+    max_iterations=5, converge_dist_voxels=12,
     max_nav_steps_per_iter=15,
 ):
     """GD 导航链：检测目标→3D反投影→迭代螺旋搜索导航。
@@ -1075,15 +1099,24 @@ def grounded_navigate_to_object(
 
         logging.info(f"  GD detect {detect_attempt}: '{phrase}' score={score:.3f}")
 
+        # Quality filter: reject oversized bbox or low confidence
+        best_bbox, filter_reason = gd_quality_filter(
+            bbox, score, (rgb.shape[0], rgb.shape[1])
+        )
+        if best_bbox is None:
+            print(f"[GD Filter] Rejected detection: {filter_reason} "
+                  f"(score={score:.2f}, bbox={bbox})")
+            continue
+
         # SAM mask
         try:
             sam_out = scene.sam_predictor.predict(
-                rgb, bboxes=[bbox.tolist()], verbose=False)
+                rgb, bboxes=[best_bbox.tolist()], verbose=False)
             mask = sam_out[0].masks.data.cpu().numpy()[0].astype(bool)
         except Exception as e:
             logging.warning(f"  GD detect {detect_attempt}: SAM failed: {e}")
             mask = np.zeros(rgb.shape[:2], dtype=bool)
-            x1, y1, x2, y2 = bbox.astype(int)
+            x1, y1, x2, y2 = best_bbox.astype(int)
             mask[y1:y2, x1:x2] = True
 
         # 3D back-project — pass RAW Habitat cam_pose (OpenGL z-back convention)
@@ -1147,7 +1180,7 @@ def grounded_navigate_to_object(
         break
 
     if target_normal is None:
-        return pts, angle, False, f"GD detection failed for '{object_desc}'", images
+        return pts, angle, False, f"GD detection failed for '{object_desc}'", images, None
 
     target_voxel_xy = (
         int(target_voxel[0]), int(target_voxel[1]))
@@ -1326,7 +1359,7 @@ def grounded_navigate_to_object(
                 continue
 
     if converged:
-        return cur_pts, cur_angle, True, f"Reached target: {object_desc}", images
+        return cur_pts, cur_angle, True, f"Reached target: {object_desc}", images, target_normal
     if arrived_any:
-        return cur_pts, cur_angle, True, f"Near target: {object_desc}", images
-    return cur_pts, cur_angle, False, f"GD navigation incomplete for '{object_desc}'", images
+        return cur_pts, cur_angle, True, f"Near target: {object_desc}", images, target_normal
+    return cur_pts, cur_angle, False, f"GD navigation incomplete for '{object_desc}'", images, target_normal
