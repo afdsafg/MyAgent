@@ -1030,6 +1030,7 @@ def grounded_navigate_to_object(
     detection_model=None, sam_predictor=None,
     clip_model=None, clip_preprocess=None, clip_tokenizer=None,
     cnt_step_base=0, step_budget=None,
+    run_logger=None,
 ):
     """GD 导航链：VLM 选定视角 → GD 检测 → 3D 反投影 → 迭代螺旋搜索导航。
 
@@ -1090,6 +1091,10 @@ def grounded_navigate_to_object(
         x1, y1, x2, y2 = bbox.astype(int)
         mask[y1:y2, x1:x2] = True
 
+    # Log GD detection (after mask is available)
+    if run_logger is not None:
+        run_logger.log_gd_detection(rgb, bbox, mask, phrase, score)
+
     # 3D back-projection — STRICTLY follow debug_iterative_spiral_navigate.py
     # CRITICAL FIX: use TSDF pose + z_forward convention (not raw Habitat pose)
     cam_pose_tsdf = pose_habitat_to_tsdf(cam_pose_habitat)
@@ -1146,6 +1151,15 @@ def grounded_navigate_to_object(
         f"  GD: target normal={target_normal.tolist()} "
         f"voxel={target_voxel.tolist()}")
 
+    # Log backprojection
+    if run_logger is not None:
+        pcd_voxel_list = []
+        for p in pcd_np_clipped:
+            v = tsdf_planner.normal2voxel(p)[:2]
+            pcd_voxel_list.append((int(v[0]), int(v[1])))
+        run_logger.log_backprojection(
+            tsdf_planner, target_normal, target_voxel, pcd_voxel_list)
+
     # ── Phase B: Iterative spiral search + per-step navigation ──
     # Port from debug_iterative_spiral_navigate.py lines 661-906
     # Per HM-GE stage-3 notes:
@@ -1161,6 +1175,8 @@ def grounded_navigate_to_object(
     arrived_any = False
     map_h, map_w = tsdf_planner._tsdf_vol_cpu.shape[:2]
     max_spiral_radius = max(map_h, map_w)
+    spiral_results_history = []
+    nav_trace = []
 
     for iteration in range(1, max_iterations + 1):
         if step_budget is not None and gd_silent_step._step_counter >= step_budget:
@@ -1206,6 +1222,12 @@ def grounded_navigate_to_object(
                 logging.warning(f"  GD iter {iteration}: spiral found nothing")
                 break
 
+        # Log spiral search
+        if run_logger is not None:
+            run_logger.log_spiral_search(
+                iteration, target_voxel_xy, spiral_result, tsdf_planner)
+            spiral_results_history.append(spiral_result)
+
         # 4. Convergence check
         spiral_dist = spiral_result["spiral_dist"]
         logging.info(
@@ -1248,6 +1270,20 @@ def grounded_navigate_to_object(
 
             cur_pts, cur_angle, _, _, _, target_arrived = result
 
+            # Record for nav trace
+            nav_trace.append({
+                "pts": cur_pts.tolist(),
+                "voxel_xy": tsdf_planner.habitat2voxel(cur_pts)[:2].tolist(),
+                "angle_rad": float(cur_angle),
+                "target_arrived": target_arrived,
+            })
+
+            # Log nav step
+            if run_logger is not None:
+                run_logger.log_nav_step(
+                    iteration, nav_step, cur_pts, cur_angle, tsdf_planner,
+                    nav_trace, target_voxel_xy, spiral_results_history)
+
             # Per-step silent perception (scene graph + TSDF + snapshot)
             gd_silent_step(
                 scene, tsdf_planner, cur_pts, cur_angle,
@@ -1255,6 +1291,7 @@ def grounded_navigate_to_object(
                 memory_store, cam_intr, cfg,
                 detection_model, sam_predictor,
                 clip_model, clip_preprocess, clip_tokenizer,
+                run_logger=run_logger,
             )
 
             # Refresh grids (map grows with new observations)
@@ -1285,6 +1322,12 @@ def grounded_navigate_to_object(
         tsdf_planner.max_point = None
         tsdf_planner.target_point = None
 
+        # Log iteration summary
+        if run_logger is not None:
+            run_logger.log_iter_summary(
+                iteration, tsdf_planner, nav_trace, spiral_results_history,
+                target_voxel_xy)
+
         # 7. Iteration termination logic
         if converged and arrived:
             logging.info(f"  GD: converged and arrived at iteration {iteration}")
@@ -1295,4 +1338,10 @@ def grounded_navigate_to_object(
         logging.info(f"  GD iter {iteration}: didn't arrive, continuing from current pos")
 
     status = f"GD nav: {'converged' if converged else 'not converged'}, arrived={arrived_any}"
+
+    # Log final topdown
+    if run_logger is not None:
+        run_logger.log_final_topdown(
+            tsdf_planner, nav_trace, spiral_results_history, target_voxel_xy)
+
     return cur_pts, cur_angle, arrived_any, status, images

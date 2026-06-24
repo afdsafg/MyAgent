@@ -16,7 +16,7 @@ def silent_perception_step(
     scene, tsdf_planner, pts, angle, cnt_step, memory_store,
     cam_intr, cfg, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer,
-    skip_snapshots=False,
+    skip_snapshots=False, run_logger=None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """每 step 静默执行：3 视角观测 + 全管线更新 + Snapshot 存档。
 
@@ -91,6 +91,16 @@ def silent_perception_step(
                 clip_tokenizer=clip_tokenizer,
             )
 
+            # Log snapshot
+            if run_logger is not None:
+                run_logger.log_snapshot(
+                    snapshot_id=f"step{step_id}_view{i}",
+                    image=view_rgb,
+                    room_id=room_id,
+                    objects_in_view=objs_in_view,
+                    position=pts.tolist(),
+                )
+
     return pts, angle
 
 
@@ -102,6 +112,7 @@ def _navigate_to_target_with_agent_step(
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
     seed_view_manager=None, active_seed_ids=None,
+    run_logger=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, int]:
     """循环调用 set_next_navigation_point + agent_step 直到抵达目标。
 
@@ -148,6 +159,7 @@ def _navigate_to_target_with_agent_step(
             scene, tsdf_planner, cur_pts, cur_angle, cnt_step + substeps,
             memory_store, cam_intr, cfg, detection_model, sam_predictor,
             clip_model, clip_preprocess, clip_tokenizer,
+            run_logger=run_logger,
         )
 
         # Update seed views if conditions met (lazy update)
@@ -381,6 +393,7 @@ def navigate_to_object(
     memory_store, cam_intr, cfg, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_steps=20, step_budget=None,
+    run_logger=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """GD 导航到指定物体。返回 (pts, angle, success, status, img_b64)。
 
@@ -409,6 +422,7 @@ def navigate_to_object(
         clip_model=clip_model, clip_preprocess=clip_preprocess,
         clip_tokenizer=clip_tokenizer,
         cnt_step_base=cnt_step, step_budget=step_budget,
+        run_logger=run_logger,
     )
 
     # GD 导航内部每子步已做 silent_perception + refresh + update_frontier
@@ -425,6 +439,7 @@ def navigate_to_seed(
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
     seed_view_manager=None, active_seed_ids=None,
+    run_logger=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """导航到指定房间种子点。返回 (pts, angle, success, status, img_b64)。
 
@@ -465,6 +480,7 @@ def navigate_to_seed(
         step_budget=step_budget,
         seed_view_manager=seed_view_manager,
         active_seed_ids=active_seed_ids or [],
+        run_logger=run_logger,
     )
 
     # 抵达后更新 frontier / 房间分割
@@ -485,6 +501,7 @@ def navigate_to_frontier(
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
     seed_view_manager=None, active_seed_ids=None,
+    run_logger=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """导航到指定 frontier。返回 (pts, angle, success, status, img_b64)。
 
@@ -509,6 +526,7 @@ def navigate_to_frontier(
         step_budget=step_budget,
         seed_view_manager=seed_view_manager,
         active_seed_ids=active_seed_ids or [],
+        run_logger=run_logger,
     )
 
     if np.linalg.norm(final_pts - cur_pts) > 1e-3:

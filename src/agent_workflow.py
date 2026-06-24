@@ -310,6 +310,22 @@ def run_episode(
         "error": "",
     }
 
+    # Initialize RunLogger (before try so it's available in finally)
+    from src.run_logger import RunLogger
+    viz_cfg = getattr(cfg, 'visualization', {})
+    if hasattr(viz_cfg, 'enabled'):
+        viz_cfg = OmegaConf.to_container(viz_cfg, resolve=True)
+    run_logger = RunLogger(
+        output_root=viz_cfg.get('output_root',
+                                getattr(cfg, 'visualization_output_root', 'results')),
+        enabled=viz_cfg.get('enabled',
+                             getattr(cfg, 'save_visualization', True)),
+        save_nav_topdown=viz_cfg.get('save_nav_topdown', True),
+        save_nav_views=viz_cfg.get('save_nav_views', False),
+        save_seed_history=viz_cfg.get('save_seed_history', False),
+        dpi=viz_cfg.get('dpi', 110),
+    )
+
     # Initialize scene, planner, memory, context
     scene = None
     tsdf_planner = None
@@ -379,6 +395,8 @@ def run_episode(
             output_dir=os.path.join(output_dir, f"memory_{question_id}"))
         context = ContextManager()
 
+        run_logger.init_episode(question_id, question, answer="")
+
     except Exception as e:
         logger.error(f"Initialization failed: {e}")
         result["error"] = str(e)
@@ -398,8 +416,11 @@ def run_episode(
         )
         total_steps += 1
 
+        # Log panorama
+        run_logger.log_panorama(panorama_views, mosaic_b64, question)
+
         # SeedViewManager: register seeds from current frontier/room map
-        seed_view_manager = SeedViewManager()
+        seed_view_manager = SeedViewManager(run_logger=run_logger)
         if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
             logger.info(f"Stage 1: found {len(tsdf_planner.room_regions)} rooms")
             _register_new_seeds(seed_view_manager, tsdf_planner, scene, pts)
@@ -426,9 +447,16 @@ def run_episode(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": pano_text + "\n" + stage_prompt},
                 ]
+                _t0_vlm = time.time()
                 vlm_response = call_vlm(messages, image_b64=mosaic_b64)
                 vlm_call_count += 1
                 vlm_parsed = _parse_vlm_response(vlm_response)
+                _latency_vlm = int((time.time() - _t0_vlm) * 1000)
+                run_logger.log_vlm_decision(
+                    stage=current_stage, input_image=mosaic_b64,
+                    response_text=vlm_response, parsed=vlm_parsed,
+                    reason=vlm_parsed.get("reason", ""),
+                    latency_ms=_latency_vlm)
 
                 if vlm_parsed.get("tool") == "missing_reason":
                     consecutive_missing_reason += 1
@@ -479,9 +507,16 @@ def run_episode(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": stage_prompt},
                 ]
+                _t0_vlm = time.time()
                 vlm_response = call_vlm(messages, image_b64=seed_mosaic)
                 vlm_call_count += 1
                 vlm_parsed = _parse_vlm_response(vlm_response)
+                _latency_vlm = int((time.time() - _t0_vlm) * 1000)
+                run_logger.log_vlm_decision(
+                    stage=current_stage, input_image=seed_mosaic,
+                    response_text=vlm_response, parsed=vlm_parsed,
+                    reason=vlm_parsed.get("reason", ""),
+                    latency_ms=_latency_vlm)
 
                 if vlm_parsed.get("tool") == "missing_reason":
                     consecutive_missing_reason += 1
@@ -508,6 +543,7 @@ def run_episode(
                         step_budget=step_budget,
                         seed_view_manager=seed_view_manager,
                         active_seed_ids=[sid for sid in seed_view_manager.seeds],
+                        run_logger=run_logger,
                     )
                     total_steps += 1
                     # Register any new seeds discovered after navigation
@@ -526,9 +562,16 @@ def run_episode(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": stage_prompt},
                 ]
+                _t0_vlm = time.time()
                 vlm_response = call_vlm(messages, image_b64=numpy_to_base64(rgb))
                 vlm_call_count += 1
                 vlm_parsed = _parse_vlm_response(vlm_response)
+                _latency_vlm = int((time.time() - _t0_vlm) * 1000)
+                run_logger.log_vlm_decision(
+                    stage=current_stage, input_image=numpy_to_base64(rgb),
+                    response_text=vlm_response, parsed=vlm_parsed,
+                    reason=vlm_parsed.get("reason", ""),
+                    latency_ms=_latency_vlm)
 
                 if vlm_parsed.get("tool") == "missing_reason":
                     consecutive_missing_reason += 1
@@ -561,6 +604,7 @@ def run_episode(
                     clip_model=clip_model, clip_preprocess=clip_preprocess,
                     clip_tokenizer=clip_tokenizer, cnt_step=total_steps,
                     step_budget=step_budget,
+                    run_logger=run_logger,
                 )
                 total_steps += 1
                 current_stage = 5
@@ -591,9 +635,16 @@ def run_episode(
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": stage_prompt},
                 ]
+                _t0_vlm = time.time()
                 vlm_response = call_vlm(messages, image_b64=mosaic_3)
                 vlm_call_count += 1
                 vlm_parsed = _parse_vlm_response(vlm_response)
+                _latency_vlm = int((time.time() - _t0_vlm) * 1000)
+                run_logger.log_vlm_decision(
+                    stage=current_stage, input_image=mosaic_3,
+                    response_text=vlm_response, parsed=vlm_parsed,
+                    reason=vlm_parsed.get("reason", ""),
+                    latency_ms=_latency_vlm)
 
                 if vlm_parsed.get("tool") == "missing_reason":
                     consecutive_missing_reason += 1
@@ -654,9 +705,16 @@ def run_episode(
                 if hasattr(tsdf_planner, '_last_frontier_image') and tsdf_planner._last_frontier_image is not None:
                     frontier_img = numpy_to_base64(tsdf_planner._last_frontier_image)
 
+                _t0_vlm = time.time()
                 vlm_response = call_vlm(messages, image_b64=frontier_img)
                 vlm_call_count += 1
                 vlm_parsed = _parse_vlm_response(vlm_response)
+                _latency_vlm = int((time.time() - _t0_vlm) * 1000)
+                run_logger.log_vlm_decision(
+                    stage=current_stage, input_image=frontier_img,
+                    response_text=vlm_response, parsed=vlm_parsed,
+                    reason=vlm_parsed.get("reason", ""),
+                    latency_ms=_latency_vlm)
 
                 if vlm_parsed.get("tool") == "missing_reason":
                     consecutive_missing_reason += 1
@@ -679,6 +737,7 @@ def run_episode(
                     step_budget=step_budget,
                     seed_view_manager=seed_view_manager,
                     active_seed_ids=[sid for sid in seed_view_manager.seeds],
+                    run_logger=run_logger,
                 )
                 total_steps += 1
                 # Register any new seeds discovered after navigation
@@ -693,8 +752,15 @@ def run_episode(
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": stage_prompt},
             ]
+            _t0_vlm = time.time()
             vlm_response = call_vlm(messages)
             vlm_parsed = _parse_vlm_response(vlm_response)
+            _latency_vlm = int((time.time() - _t0_vlm) * 1000)
+            run_logger.log_vlm_decision(
+                stage=6, input_image=None,
+                response_text=vlm_response, parsed=vlm_parsed,
+                reason=vlm_parsed.get("reason", ""),
+                latency_ms=_latency_vlm)
             answer = vlm_parsed.get("answer", vlm_parsed.get("arguments", "unanswerable"))
             logger.info(f"Final answer: {answer}")
 
@@ -710,6 +776,8 @@ def run_episode(
         result["error"] = str(e)
 
     finally:
+        # Write summary
+        run_logger.log_summary(result)
         # Cleanup
         if scene is not None:
             try:

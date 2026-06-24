@@ -32,6 +32,15 @@ hfov: 120
 # whether to save visualization (which is slow)
 save_visualization: true
 
+# visualization settings
+visualization:
+  enabled: true
+  output_root: "results"
+  save_nav_topdown: true
+  save_nav_views: false
+  save_seed_history: false
+  dpi: 110
+
 # the image size for prompting gpt-4o
 prompt_h: 360
 prompt_w: 360

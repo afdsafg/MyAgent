@@ -15,8 +15,9 @@ from typing import Dict, List, Optional
 class SeedViewManager:
     """Manages seed direction images with lazy updates."""
 
-    def __init__(self):
+    def __init__(self, run_logger=None):
         self.seeds: Dict[int, dict] = {}
+        self.run_logger = run_logger
         # Each entry: {"image": np.ndarray, "view_image_pos": np.ndarray,
         #              "view_image_angle": float, "seed_position": np.ndarray}
 
@@ -37,6 +38,12 @@ class SeedViewManager:
             "seed_position": position.copy(),
         }
         logging.info(f"  SeedViewManager: registered seed {seed_id} at {position.tolist()}")
+
+        # Log seed view update
+        if self.run_logger is not None:
+            self.run_logger.log_seed_view_update(
+                seed_id, obs["color_sensor"][..., :3], agent_pts,
+                reason="registered", angle=angle_to_seed)
 
     def update_after_step(self, active_seed_ids: List[int],
                           cur_pts: np.ndarray, tsdf_planner, scene,
@@ -79,6 +86,13 @@ class SeedViewManager:
             seed["view_image_angle"] = float(angle_to_seed)
             logging.info(f"  SeedViewManager: updated seed {seed_id} "
                         f"(dist {last_dist:.2f}->{cur_dist:.2f})")
+
+            # Log seed view update
+            if self.run_logger is not None:
+                self.run_logger.log_seed_view_update(
+                    seed_id, obs["color_sensor"][..., :3], cur_pts,
+                    reason=f"dist_decreased ({last_dist:.2f}->{cur_dist:.2f})",
+                    angle=angle_to_seed)
 
     def get_mosaic(self, question: str, max_seeds: int = 8) -> Optional[np.ndarray]:
         """Build a mosaic of all seed images with seed_id labels.
