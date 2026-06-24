@@ -72,7 +72,7 @@ class Executor:
     def explore_panorama(self, config: Optional[dict] = None) -> TrajectoryEvidence:
         from src.agent_tools import observe_panorama
 
-        pts, angle, _mosaic_b64, text = observe_panorama(
+        pts, angle, _mosaic_b64, text, _panorama_views = observe_panorama(
             self.scene,
             self.tsdf,
             self._pts,
