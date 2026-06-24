@@ -26,10 +26,12 @@ class SeedViewManager:
         """Register a new seed and render its initial view image.
 
         Renders the view from agent's current position toward the seed.
+        Habitat-sim forward is -z, so yaw = atan2(-dx, -dz).
+        (Per debug_render_episode.py:907-908)
         """
         angle_to_seed = math.atan2(
-            position[0] - agent_pts[0],
-            position[2] - agent_pts[2])
+            -(position[0] - agent_pts[0]),
+            -(position[2] - agent_pts[2]))
         obs, _ = scene.get_observation(agent_pts, angle_to_seed)
         self.seeds[seed_id] = {
             "image": obs["color_sensor"][..., :3],
@@ -78,8 +80,8 @@ class SeedViewManager:
 
             # Update
             angle_to_seed = math.atan2(
-                seed_pos[0] - cur_pts[0],
-                seed_pos[2] - cur_pts[2])
+                -(seed_pos[0] - cur_pts[0]),
+                -(seed_pos[2] - cur_pts[2]))
             obs, _ = scene.get_observation(cur_pts, angle_to_seed)
             seed["image"] = obs["color_sensor"][..., :3]
             seed["view_image_pos"] = cur_pts.copy()
