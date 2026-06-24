@@ -171,37 +171,21 @@ class Planner:
         return PlannerAction(action_type="explore_panorama", reason="Parse failed", confidence=0.0)
 
     def _call_api(self, messages: list[dict]) -> str:
-        """Call mimo-v2.5 via requests.post (matches original call_vlm pattern)."""
-        payload = {
-            "model": self.model_name,
-            "messages": messages,
-            "max_tokens": 1024,
-            "temperature": 0.3,
-        }
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
-        proxies = {}
-        proxy_http = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
-        proxy_https = os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
-        if proxy_http:
-            proxies["http"] = proxy_http
-        if proxy_https:
-            proxies["https"] = proxy_https
-
+        """Call mimo-v2.5 via OpenAI-compatible client."""
+        import openai
+        client = openai.OpenAI(
+            api_key=self.api_key,
+            base_url="https://opencode.ai/zen/go/v1",
+        )
         try:
-            resp = requests.post(
-                self.base_url, json=payload, headers=headers,
-                timeout=180, proxies=proxies if proxies else None)
+            response = client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+                temperature=0.3,
+                max_tokens=1024,
+            )
+            content = response.choices[0].message.content
+            return content if content else ""
         except Exception as e:
-            logger.error(f"Planner API request failed: {e}")
+            logger.error(f"Planner API error: {e}")
             return ""
-
-        if resp.status_code != 200:
-            logger.error(f"Planner API error: {resp.status_code} {resp.text[:500]}")
-            return ""
-
-        data = resp.json()
-        content = data.get("choices", [{}])[0].get("message", {}).get("content")
-        return content if content else ""
