@@ -447,7 +447,6 @@ def navigate_to_seed(
     VLM 在调用此函数后不参与每子步决策，只在抵达后由调用方唤醒。
     """
     from src.agent_image_utils import numpy_to_base64
-    from src.tsdf_planner import Frontier
 
     room = None
     for r in tsdf_planner.room_regions:
@@ -457,30 +456,28 @@ def navigate_to_seed(
     if room is None:
         return pts, angle, False, f"Room {room_id} not found", None
 
-    # 构造临时 Frontier 作为导航目标
-    cur_voxel = tsdf_planner.habitat2voxel(pts)[:2]
-    direction = room.center.astype(np.float64) - cur_voxel
-    direction_norm = np.linalg.norm(direction)
-    if direction_norm > 1e-6:
-        direction = direction / direction_norm
-    else:
-        direction = np.array([0.0, 0.0])
-    temp_frontier = Frontier(
-        position=room.center.astype(np.float64),
-        orientation=direction,
-        region=room.region,
-        frontier_id=-room_id,
-    )
+    # 将 room.center (2D voxel [vy,vx]) 转为 habitat 坐标
+    # 并用 target_type="image" 路径导航（使用 unoccupied + pathfinder
+    # 而非 Frontier walk-back，后者只找到 agent 所在岛屿边界上的点）
+    from src.habitat import pos_normal_to_habitat
+    vy, vx = int(room.center[0]), int(room.center[1])
+    voxel_size = tsdf_planner._voxel_size
+    world_y = tsdf_planner._vol_bnds[0, 0] + (vy + 0.5) * voxel_size
+    world_x = tsdf_planner._vol_bnds[1, 0] + (vx + 0.5) * voxel_size
+    seed_normal = np.array([world_y, world_x, float(pts[1])], dtype=float)
+    seed_habitat = pos_normal_to_habitat(seed_normal)
 
+    # 用 target_type="image" 路径导航
     cur_pts, cur_angle = pts, angle
     final_pts, final_angle, arrived, status, substeps = _navigate_to_target_with_agent_step(
-        scene, tsdf_planner, cur_pts, cur_angle, temp_frontier, cfg,
+        scene, tsdf_planner, cur_pts, cur_angle, seed_habitat, cfg,
         memory_store, cam_intr, detection_model, sam_predictor,
         clip_model, clip_preprocess, clip_tokenizer, cnt_step, max_substeps,
         step_budget=step_budget,
         seed_view_manager=seed_view_manager,
         active_seed_ids=active_seed_ids or [],
         run_logger=run_logger,
+        target_type="image",
     )
 
     # 抵达后更新 frontier / 房间分割
