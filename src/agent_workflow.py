@@ -1076,9 +1076,21 @@ def run_episode_two_tier(
         # ── Helper builders ──────────────────────────────────────────
 
         def _build_scene_analysis() -> str:
-            lines = []
+            lines = ["## Scene Analysis"]
+            
+            # Detected objects from scene graph
+            if hasattr(scene, "objects") and scene.objects:
+                obj_names = list(set(
+                    obj["class_name"] for obj in scene.objects.values()
+                    if isinstance(obj, dict) and "class_name" in obj
+                ))[:30]
+                if obj_names:
+                    lines.append(f"Objects detected nearby: {', '.join(obj_names)}")
+            else:
+                lines.append("No objects detected yet.")
+            
+            # Room info
             if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
-                lines.append("## Scene Analysis")
                 for room in tsdf_planner.room_regions:
                     lines.append(
                         f"- Room {room.room_id}: area={room.area:.0f}, "
@@ -1086,7 +1098,7 @@ def run_episode_two_tier(
                         f"frontiers={getattr(room, 'frontier_ids', [])}"
                     )
             else:
-                lines.append("## Scene Analysis\nNo room segmentation available.")
+                lines.append("No room segmentation available.")
             return "\n".join(lines)
 
         def _build_progress(round_num: int) -> str:

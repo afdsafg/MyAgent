@@ -58,14 +58,23 @@ class Executor:
     def _collect_nearby(self, pts) -> list:
         if not hasattr(self.scene, "objects"):
             return []
-        return [
-            obj["class_name"]
-            for obj in self.scene.objects.values()
-            if hasattr(obj, "bbox") and obj.get("bbox") is not None
-            and __import__("numpy").linalg.norm(
-                obj["bbox"].center[[0, 2]] - pts[[0, 2]]
-            ) < self.cfg.scene_graph.obj_include_dist + 0.5
-        ]
+        nearby = []
+        for obj in self.scene.objects.values():
+            if not isinstance(obj, dict) or "class_name" not in obj:
+                continue
+            name = obj["class_name"]
+            # Try to get position from bbox or point_cloud
+            obj_pos = None
+            if "bbox" in obj and obj["bbox"] is not None and hasattr(obj["bbox"], "center"):
+                obj_pos = obj["bbox"].center
+            elif "point_cloud" in obj:
+                obj_pos = obj["point_cloud"].mean(axis=0)
+            if obj_pos is not None:
+                import numpy as np
+                dist = np.linalg.norm(obj_pos[[0, 2]] - pts[[0, 2]])
+                if dist < 3.0:  # within 3m
+                    nearby.append(name)
+        return list(set(nearby))
 
     # ── 6 tools ───────────────────────────────────────────────────────
 
