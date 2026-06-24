@@ -94,15 +94,23 @@ class SeedViewManager:
                     reason=f"dist_decreased ({last_dist:.2f}->{cur_dist:.2f})",
                     angle=angle_to_seed)
 
-    def get_mosaic(self, question: str, max_seeds: int = 8) -> Optional[np.ndarray]:
-        """Build a mosaic of all seed images with seed_id labels.
+    def get_mosaic(self, question: str, seed_ids: Optional[List[int]] = None,
+                   max_seeds: int = 8) -> Optional[np.ndarray]:
+        """Build a mosaic of seed images with seed_id labels.
+
+        If seed_ids is provided, only those seeds are shown.
+        Otherwise shows all registered seeds.
 
         Returns RGB numpy array, or None if no seeds.
         """
         if not self.seeds:
             return None
 
-        seeds = list(self.seeds.items())[:max_seeds]
+        if seed_ids is not None:
+            filtered = [(sid, self.seeds[sid]) for sid in seed_ids if sid in self.seeds]
+        else:
+            filtered = list(self.seeds.items())
+        seeds = filtered[:max_seeds]
         n = len(seeds)
         cols = min(4, n)
         rows = (n + cols - 1) // cols

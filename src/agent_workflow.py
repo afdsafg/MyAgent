@@ -501,7 +501,7 @@ def run_episode(
                     current_stage = 6
                     continue
 
-                seed_mosaic = seed_view_manager.get_mosaic(question)
+                seed_mosaic = seed_view_manager.get_mosaic(question, seed_ids=seed_ids)
                 seed_info = f"Available seeds: {seed_ids}"
                 stage_prompt = STAGE2_5A_PROMPT.format(
                     seed_info=seed_info, question=question)
