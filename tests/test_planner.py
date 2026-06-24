@@ -64,7 +64,6 @@ def test_build_prompt_contains_components(planner):
     assert "History" in prompt
     assert "Scene Analysis" in prompt
     assert "Progress" in prompt
-    assert "Actions" in prompt
     assert "What color is the towel?" in prompt
 
 

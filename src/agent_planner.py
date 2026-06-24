@@ -106,7 +106,7 @@ class Planner:
         history: str,
         scene: str,
         progress: str,
-        _actions: str,
+        actions: str,
     ) -> str:
         """Build 4-component prompt with selected actions."""
         return (
