@@ -70,8 +70,8 @@ result = run_episode_two_tier(
     clip_preprocess=clip_preprocess,
     clip_tokenizer=clip_tokenizer,
     output_dir=output_dir,
-    max_planner_rounds=10,
-    max_total_steps=50,
+    max_planner_rounds=20,
+    max_total_steps=80,
     start_pts=pts,
     start_angle=angle,
 )
