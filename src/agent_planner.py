@@ -113,37 +113,36 @@ class Planner:
             f"{scene}\n\n"
             f"{progress}\n\n"
             f"{actions}\n\n"
-            "Output your decision as JSON with these fields:\n"
-            '{"reason": "...", "action": "...", "confidence": 0.0-1.0, '
-            '[optional: "object_name", "seed_id", "frontier_id", "view_idx", "answer"]}'
+            "Think step by step about what to do next. "
+            "Then on the FINAL LINE ONLY, output a JSON object with these fields:\n"
+            '{"reason": "...", "action": "...", "confidence": 0.0-1.0'
+            ', "object_name": "...", "seed_id": "N", "frontier_id": "N", "view_idx": N, "answer": "..."}'
         )
 
     def parse_response(self, response: str) -> PlannerAction:
-        """Parse VLM JSON response into a PlannerAction."""
+        """Parse VLM response (may contain reasoning + final JSON)."""
         if not response:
             return PlannerAction(action_type="explore_panorama", reason="Empty VLM response", confidence=0.0)
         import re
-        data = None
         raw = response.strip()
 
-        # Try ```json ... ``` code fences
-        m = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', raw, re.DOTALL)
-        if m:
+        # Try to find ALL JSON objects, use the LAST one (after reasoning)
+        json_objects = []
+        for m in re.finditer(r'\{[^{}]*\}', raw):
             try:
-                data = json.loads(m.group(1).strip())
+                json_objects.append(json.loads(m.group()))
             except json.JSONDecodeError:
                 pass
 
-        # Try raw { ... } extraction
-        if data is None and "{" in raw:
+        # Also try code fences
+        for m in re.finditer(r'```(?:json)?\s*\n?(.*?)\n?\s*```', raw, re.DOTALL):
             try:
-                start = raw.index("{")
-                end = raw.rindex("}") + 1
-                data = json.loads(raw[start:end])
-            except (json.JSONDecodeError, ValueError):
+                json_objects.append(json.loads(m.group(1).strip()))
+            except json.JSONDecodeError:
                 pass
 
-        if data is not None:
+        if json_objects:
+            data = json_objects[-1]  # Last JSON object is the action
             return PlannerAction(
                 action_type=data.get("action", "explore_panorama"),
                 reason=data.get("reason", ""),
@@ -155,23 +154,34 @@ class Planner:
                 answer=data.get("answer"),
             )
 
-        # Fallback: keyword-based action inference from natural language
+        # Fallback: keyword-based — but only if no JSON found at all
         raw_l = raw.lower()
-        if "submit_answer" in raw_l or "answer is" in raw_l:
-            ans = raw.split("answer is")[-1].strip().strip('"').strip()
-            return PlannerAction(action_type="submit_answer", answer=ans[:200], reason="Inferred", confidence=0.5)
-        if "navigate_to_object" in raw_l or "go to" in raw_l or "move to" in raw_l:
+        # Check if the model gave a clear final answer (last lines of reasoning)
+        last_lines = raw.strip().split('\n')[-5:]
+        last_text = ' '.join(last_lines).lower()
+        
+        if "submit_answer" in last_text or "final answer" in last_text:
+            # Extract answer from last sentence
+            for line in reversed(last_lines):
+                if 'answer' in line.lower():
+                    return PlannerAction(action_type="submit_answer", answer=line.strip()[:300],
+                                        reason="Inferred from final lines", confidence=0.5)
+            return PlannerAction(action_type="submit_answer", answer=last_lines[-1][:300],
+                                reason="Inferred final line", confidence=0.5)
+        if "navigate_to_object" in last_text:
             return PlannerAction(action_type="navigate_to_object", reason="Inferred", confidence=0.4, object_name="oven")
-        if "explore_seed" in raw_l or "go to seed" in raw_l:
+        if "explore_seed" in last_text:
             return PlannerAction(action_type="explore_seed", reason="Inferred", confidence=0.4)
-        if "explore_frontier" in raw_l or "frontier" in raw_l:
+        if "explore_frontier" in last_text:
             return PlannerAction(action_type="explore_frontier", reason="Inferred", confidence=0.4)
+        if "explore_panorama" in last_text:
+            return PlannerAction(action_type="explore_panorama", reason="Inferred", confidence=0.4)
 
-        logger.debug("Planner parse failed, raw=%.200s", raw)
+        logger.debug("Planner parse failed, raw first 300 chars: %s", raw[:300])
         return PlannerAction(action_type="explore_panorama", reason="Parse failed", confidence=0.0)
 
     def _call_api(self, messages: list[dict]) -> str:
-        """Call mimo-v2.5 via OpenAI-compatible client."""
+        """Call mimo-v2.5 API — handles both content and reasoning_content."""
         import openai
         client = openai.OpenAI(
             api_key=self.api_key,
@@ -184,19 +194,14 @@ class Planner:
                 temperature=0.3,
                 max_tokens=1024,
             )
-            # Debug: inspect raw response
-            choice = response.choices[0]
-            msg = choice.message
+            # mimo-v2.5 returns reasoning_content; check both fields
+            msg = response.choices[0].message
             content = msg.content
-            refusal = getattr(msg, 'refusal', None)
-            function_call = getattr(msg, 'function_call', None)
-            tool_calls = getattr(msg, 'tool_calls', None)
             reasoning = getattr(msg, 'reasoning_content', None)
-            logger.info(f"VLM raw: content={repr(content)[:100]}, refusal={refusal}, fn_call={function_call}, reasoning={bool(reasoning)}")
-            if content is None and reasoning:
-                # Model returned reasoning but no explicit content
-                return reasoning
-            return content if content else ""
+            
+            # Prefer reasoning_content if content is empty (mimo-v2.5 reasoning model)
+            result = content or reasoning or ""
+            return result
         except Exception as e:
             logger.error(f"Planner API error: {e}", exc_info=True)
             return ""
