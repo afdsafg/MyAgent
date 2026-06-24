@@ -240,17 +240,56 @@ def observe_panorama(
     # 后续 update_frontier_map 调用会用品配置的 0.30 重新过滤。
     try:
         from omegaconf import OmegaConf as _OC
+        import cv2 as _cv2
         room_cfg = tsdf_planner._cfg_get(cfg.planner, "room_segmentation", None)
         if room_cfg is not None:
-            # Copy and override for initial segmentation
             room_cfg_init = _OC.create(_OC.to_container(room_cfg))
             room_cfg_init.observed_ratio_threshold = 0.0
             room_cfg_init.max_unobserved_room_hops = 99
         else:
             room_cfg_init = cfg.planner
-        tsdf_planner.update_room_map(cfg=room_cfg_init, pts=pts_normal)
+
+        # Self-construct envelope at room_height (bypass get_island_around_pts
+        # which may use a different height). Per Obsidian notes v2 and
+        # diag_height.py: 1.5m finds 4 rooms, 1.8m finds 5 (with fragments).
+        room_height = float(tsdf_planner._cfg_get(room_cfg_init, "room_height", 1.5))
+        min_room_area = int(tsdf_planner._cfg_get(room_cfg_init, "min_room_area", 16))
+        seed_area_min = int(tsdf_planner._cfg_get(room_cfg_init, "seed_area_min", 6))
+        seed_area_max = int(tsdf_planner._cfg_get(room_cfg_init, "seed_area_max", 400))
+        max_dilation_iter = int(tsdf_planner._cfg_get(room_cfg_init, "max_dilation_iter", 80))
+        close_iterations = int(tsdf_planner._cfg_get(room_cfg_init, "close_iterations", 1))
+        stable_iou_threshold = float(tsdf_planner._cfg_get(room_cfg_init, "stable_iou_threshold", 0.2))
+
+        tsdf = tsdf_planner._tsdf_vol_cpu
+        voxel_size = tsdf_planner._voxel_size
+        min_height_voxel = tsdf_planner.min_height_voxel
+        hv = int(room_height / voxel_size) + min_height_voxel
+        envelope = (tsdf[:, :, hv] > 0) & (tsdf[:, :, 0] < 0)
+
+        if close_iterations > 0:
+            kernel = _cv2.getStructuringElement(_cv2.MORPH_CROSS, (3, 3))
+            envelope_u8 = (envelope.astype(np.uint8) * 255)
+            envelope = (_cv2.morphologyEx(envelope_u8, _cv2.MORPH_CLOSE, kernel,
+                         iterations=close_iterations) > 0) & envelope
+
+        if np.count_nonzero(envelope) >= min_room_area:
+            seeds = tsdf_planner._find_room_seed_masks(
+                envelope, min_area=seed_area_min, max_area=seed_area_max,
+                max_iterations=max_dilation_iter)
+            if len(seeds) == 0:
+                regions = tsdf_planner._connected_room_regions(envelope, min_room_area)
+            else:
+                regions = tsdf_planner._watershed_room_regions(envelope, seeds, min_room_area)
+
+            if len(regions) > 0:
+                # Skip _filter_room_regions_by_observed_adjacency for initial seg
+                tsdf_planner._commit_room_regions(
+                    regions, stable_iou_threshold, observed_threshold=0.0)
+                logging.info(f"observe_panorama: room_seg found {len(regions)} rooms "
+                            f"(envelope={np.count_nonzero(envelope)} voxels, h={room_height}m)")
     except Exception as e:
-        logging.warning(f"observe_panorama: update_room_map failed: {e}")
+        logging.warning(f"observe_panorama: room segmentation failed: {e}")
+        import traceback; traceback.print_exc()
 
     # 也尝试 update_frontier_map（可能发现 frontier）
     try:
