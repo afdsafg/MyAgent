@@ -152,7 +152,7 @@ class Scene:
         # set agent
         self.agent = self.simulator.initialize_agent(sim_settings["default_agent"])
 
-        self.cam_intrinsic = get_cam_intr(cfg.img_width, cfg.img_height, cfg.hfov)
+        self.cam_intrinsic = get_cam_intr(cfg.hfov, cfg.img_height, cfg.img_width)
 
         # about scene graph
         self.objects: MapObjectDict[int, Dict] = (
@@ -983,22 +983,10 @@ def _load_gd_model(gd_dir=None, device="cuda"):
 
 
 def gd_quality_filter(bbox, score, image_shape, max_bbox_ratio=0.30, min_score=0.35):
-    """Filter GD detections by bbox area ratio and confidence score.
-
-    Args:
-        bbox: [x1, y1, x2, y2] detection box
-        score: detection confidence
-        image_shape: (height, width) of the image
-        max_bbox_ratio: maximum bbox area / image area ratio (default 0.30)
-        min_score: minimum confidence score (default 0.35)
-
-    Returns:
-        (bbox, "ok") if quality passes, (None, reason) if rejected
-    """
+    """Filter GD detections by bbox area ratio and confidence."""
     bbox_area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
     image_area = image_shape[0] * image_shape[1]
     ratio = bbox_area / image_area
-
     if ratio > max_bbox_ratio:
         return None, "bbox_too_large"
     if score < min_score:
@@ -1043,29 +1031,34 @@ def _gd_detect(rgb, prompt, box_threshold=0.30, text_threshold=0.25):
 
 
 def grounded_navigate_to_object(
-    scene, tsdf_planner, pts, angle, object_desc,
+    scene, tsdf_planner, pts, angle,
+    view_idx, view_angle, view_cam_pose,  # VLM-selected view
+    object_desc,
     max_steps=20, gd_dir=None,
     max_consecutive_failures=5,
     max_iterations=5, converge_dist_voxels=12,
     max_nav_steps_per_iter=15,
+    memory_store=None, cam_intr_ext=None, cfg_ext=None,
+    detection_model=None, sam_predictor=None,
+    clip_model=None, clip_preprocess=None, clip_tokenizer=None,
+    cnt_step_base=0, step_budget=None,
 ):
-    """GD 导航链：检测目标→3D反投影→迭代螺旋搜索导航。
+    """GD 导航链：VLM 选定视角 → GD 检测 → 3D 反投影 → 迭代螺旋搜索导航。
 
-    Fixes from HM-GE stage-3 notes:
-    - Camera convention: pass raw Habitat cam_pose (OpenGL z-back) to
-      detections_to_obj_pcd_and_bbox, NOT pose_habitat_to_tsdf. The
-      resulting 3D points are in Habitat world coords; convert to normal
-      coords with pos_habitat_to_normal.
-    - Z-clip: clip points with normal[2] > 3.0m to floor height.
-    - Use pcd mean (x,y) instead of OBB center (pulled by z-clip).
-    - Pin normal[2] (height) to floor, NOT normal[1] (horizontal y).
-    - Replace 4-radius random sampling with iterative spiral search.
-    - Per-step map integration during navigation to expand navigable area.
+    视角由 VLM 在 Stage 2 选定（view_idx + view_angle + view_cam_pose）。
+    代码不做视角扫描，只用 VLM 选定的那张图做 GD 检测。
+
+    Key fixes from HM-GE stage-3 notes:
+    - trans_pose = pose_habitat_to_tsdf(cam_pose)  (NOT raw Habitat cam_pose)
+    - camera_convention = "z_forward"  (matches TSDF pose)
+    - Result pcd is already in normal coords; no pos_habitat_to_normal conversion
+    - Z-clip: normal[2] > 3.0m → pin to floor
+    - Target = pcd mean (x,y), pin normal[2] to floor
 
     Returns: (new_pts, new_angle, success_bool, status_text, images_list)
     """
     from PIL import Image
-    from src.habitat import pos_habitat_to_normal, pos_normal_to_habitat
+    from src.habitat import pos_habitat_to_normal, pos_normal_to_habitat, pose_habitat_to_tsdf
     from src.conceptgraph.slam.utils import (
         detections_to_obj_pcd_and_bbox,
         init_process_pcd,
@@ -1074,292 +1067,244 @@ def grounded_navigate_to_object(
     import open3d as o3d
 
     images = []
-    cam_intr = scene.cam_intrinsic
+    cam_intr = cam_intr_ext if cam_intr_ext is not None else scene.cam_intrinsic
     cfg_cg = scene.cfg_cg
     device = "cuda" if torch.cuda.is_available() else "cpu"
     floor_height = float(pts[1])
-    cfg = scene.cfg
+    cfg = cfg_ext if cfg_ext is not None else scene.cfg
 
-    # ── Phase 1: GD detect + SAM + 3D back-project → target_normal ──
-    target_normal = None
-    consecutive_detect_failures = 0
+    # ── Phase A: GD detect + SAM + 3D back-project → target_normal ──
+    # Use VLM-selected view (view_angle / view_cam_pose)
+    obs, cam_pose_habitat = scene.get_observation(pts, view_angle)
+    rgb = obs["color_sensor"]
+    depth = obs["depth_sensor"]
+    # If the caller passed the VLM-selected view's cam_pose, use it for
+    # back-projection — guarantees the pose matches the view the VLM saw
+    # (avoids any render drift between Stage 5 render and this render).
+    if view_cam_pose is not None:
+        cam_pose_habitat = view_cam_pose
 
-    for detect_attempt in range(max_consecutive_failures):
-        # Try different viewing angles if detection fails
-        search_angle = angle + detect_attempt * np.pi / 4
-        obs, cam_pose = scene.get_observation(pts, search_angle)
-        rgb = obs["color_sensor"]
-        depth = obs["depth_sensor"]
+    bbox, phrase, score, _ = _gd_detect(rgb, object_desc)
+    if bbox is None:
+        return pts, angle, False, f"GD no detection for '{object_desc}'", images
 
-        bbox, phrase, score, _ = _gd_detect(rgb, object_desc)
-        if bbox is None:
-            logging.info(f"  GD detect {detect_attempt}: no detection for '{object_desc}'")
-            consecutive_detect_failures += 1
-            continue
+    logging.info(f"  GD: '{phrase}' score={score:.3f}")
+    images.append(("gd_detection", rgb.copy()))
 
-        logging.info(f"  GD detect {detect_attempt}: '{phrase}' score={score:.3f}")
+    # SAM mask
+    try:
+        sam_out = scene.sam_predictor.predict(
+            rgb, bboxes=[bbox.tolist()], verbose=False)
+        mask = sam_out[0].masks.data.cpu().numpy()[0].astype(bool)
+    except Exception as e:
+        logging.warning(f"  GD: SAM failed: {e}, using bbox as mask")
+        mask = np.zeros(rgb.shape[:2], dtype=bool)
+        x1, y1, x2, y2 = bbox.astype(int)
+        mask[y1:y2, x1:x2] = True
 
-        # Quality filter: reject oversized bbox or low confidence
-        best_bbox, filter_reason = gd_quality_filter(
-            bbox, score, (rgb.shape[0], rgb.shape[1])
+    # 3D back-projection — STRICTLY follow debug_iterative_spiral_navigate.py
+    # CRITICAL FIX: use TSDF pose + z_forward convention (not raw Habitat pose)
+    cam_pose_tsdf = pose_habitat_to_tsdf(cam_pose_habitat)
+    try:
+        obj_list = detections_to_obj_pcd_and_bbox(
+            depth_array=depth,
+            masks=mask[None, :, :].astype(np.float32),
+            cam_K=cam_intr,
+            image_rgb=rgb,
+            trans_pose=cam_pose_tsdf,            # TSDF pose (FIXED)
+            camera_convention="z_forward",        # matches TSDF pose (FIXED)
+            min_points_threshold=5,
+            spatial_sim_type=cfg_cg.spatial_sim_type,
+            obj_pcd_max_points=cfg_cg.obj_pcd_max_points,
+            downsample_voxel_size=getattr(cfg_cg, 'downsample_voxel_size',
+                getattr(cfg_cg, 'downsample_voxcel_size', 0.02)),
+            dbscan_remove_noise=getattr(cfg_cg, 'dbscan_remove_noise', False),
+            dbscan_eps=getattr(cfg_cg, 'dbscan_eps', 0.01),
+            dbscan_min_points=getattr(cfg_cg, 'dbscan_min_points', 3),
+            run_dbscan=getattr(cfg_cg, 'dbscan_remove_noise', False),
+            device=device,
         )
-        if best_bbox is None:
-            print(f"[GD Filter] Rejected detection: {filter_reason} "
-                  f"(score={score:.2f}, bbox={bbox})")
-            continue
+    except Exception as e:
+        logging.warning(f"  GD: back-project failed: {e}")
+        return pts, angle, False, f"Back-projection failed: {e}", images
 
-        # SAM mask
-        try:
-            sam_out = scene.sam_predictor.predict(
-                rgb, bboxes=[best_bbox.tolist()], verbose=False)
-            mask = sam_out[0].masks.data.cpu().numpy()[0].astype(bool)
-        except Exception as e:
-            logging.warning(f"  GD detect {detect_attempt}: SAM failed: {e}")
-            mask = np.zeros(rgb.shape[:2], dtype=bool)
-            x1, y1, x2, y2 = best_bbox.astype(int)
-            mask[y1:y2, x1:x2] = True
+    if not obj_list or obj_list[0] is None:
+        return pts, angle, False, "Back-projection returned None", images
 
-        # 3D back-project — pass RAW Habitat cam_pose (OpenGL z-back convention)
-        # NOT pose_habitat_to_tsdf(cam_pose). The back-projection code uses
-        # OpenGL convention (valid z < 0 = in front). Result is in Habitat coords.
-        try:
-            obj_list = detections_to_obj_pcd_and_bbox(
-                depth_array=depth,
-                masks=mask[None, :, :].astype(np.float32),
-                cam_K=cam_intr,
-                image_rgb=rgb,
-                trans_pose=cam_pose,  # raw Habitat pose, NOT TSDF
-                min_points_threshold=5,
-                spatial_sim_type=cfg_cg.spatial_sim_type,
-                obj_pcd_max_points=cfg_cg.obj_pcd_max_points,
-                downsample_voxel_size=cfg_cg.get('downsample_voxel_size',
-                    cfg_cg.get('downsample_voxcel_size', 0.02))
-                    if isinstance(cfg_cg, dict)
-                    else getattr(cfg_cg, 'downsample_voxel_size',
-                        getattr(cfg_cg, 'downsample_voxcel_size', 0.02)),
-                device=device,
-            )
-        except Exception as e:
-            logging.warning(f"  GD detect {detect_attempt}: back-project failed: {e}")
-            consecutive_detect_failures += 1
-            continue
+    obj = obj_list[0]
+    pcd = obj["pcd"]
+    if len(pcd.points) == 0:
+        return pts, angle, False, "Empty point cloud", images
 
-        if not obj_list or obj_list[0] is None:
-            logging.info(f"  GD detect {detect_attempt}: back-project returned None")
-            consecutive_detect_failures += 1
-            continue
+    # pcd_np is already in normal coords (because we used TSDF pose + z_forward)
+    pcd_np = np.asarray(pcd.points)
+    logging.info(f"  GD: back-projected {pcd_np.shape[0]} points")
 
-        obj = obj_list[0]
-        pcd = obj["pcd"]
-        if len(pcd.points) == 0:
-            consecutive_detect_failures += 1
-            continue
+    # Z-clip: pin points above 3.0m to floor height (normal[2] is height)
+    z_clip = cfg.tsdf_grid_size * 30  # 3.0m
+    pcd_np_clipped = pcd_np.copy()
+    over_z = pcd_np_clipped[:, 2] > z_clip
+    if over_z.any():
+        logging.info(f"  GD: z-clipping {int(over_z.sum())}/{len(pcd_np)} points")
+        pcd_np_clipped[over_z, 2] = floor_height
 
-        # Get point cloud in Habitat coords, convert to normal coords
-        pcd_habitat = np.asarray(pcd.points)
-        pcd_normal = pos_habitat_to_normal(pcd_habitat)
+    # Target = pcd mean (x,y) — OBB center gets pulled by z-clip
+    target_normal = pcd_np_clipped.mean(axis=0)
+    target_normal[2] = floor_height  # pin height to floor
 
-        # Z-clip: pin points above 3.0m to floor height (normal[2] = height)
-        z_clip = cfg.tsdf_grid_size * 30  # 3.0m
-        over_z = pcd_normal[:, 2] > z_clip
-        if over_z.any():
-            logging.info(f"  GD: z-clipping {int(over_z.sum())}/{len(pcd_normal)} points")
-            pcd_normal[over_z, 2] = floor_height
+    target_voxel = tsdf_planner.normal2voxel(target_normal)
+    target_voxel_xy = (int(target_voxel[0]), int(target_voxel[1]))
+    logging.info(
+        f"  GD: target normal={target_normal.tolist()} "
+        f"voxel={target_voxel.tolist()}")
 
-        # Use pcd mean (x,y) — OBB center gets pulled by z-clip
-        target_normal = pcd_normal.mean(axis=0)
-        # Pin height (normal[2]) to floor, keep horizontal x/y unchanged
-        target_normal[2] = floor_height
+    # ── Phase B: Iterative spiral search + per-step navigation ──
+    # Port from debug_iterative_spiral_navigate.py lines 661-906
+    # Per HM-GE stage-3 notes:
+    #   1. Refresh grids, check if target on island
+    #   2. Spiral search nearest navigable point to target
+    #   3. set_next_navigation_point(target_type="image", ...)
+    #   4. Per-step: agent_step → silent_perception → refresh → update_frontier
+    #   5. On arrival: if converged → done; if not converged → re-spiral (continue)
+    from src.agent_tools import silent_perception_step as gd_silent_step
 
-        target_voxel = tsdf_planner.normal2voxel(target_normal)
-        logging.info(
-            f"  GD: target normal={target_normal.tolist()} "
-            f"voxel={target_voxel.tolist()}"
-        )
-        images.append((f"detect_view", rgb.copy()))
-        break
-
-    if target_normal is None:
-        return pts, angle, False, f"GD detection failed for '{object_desc}'", images, None
-
-    target_voxel_xy = (
-        int(target_voxel[0]), int(target_voxel[1]))
-
-    # ── Phase 2: Iterative spiral search + per-step navigation ──
-    # Per HM-GE stage-3 notes (迭代螺旋搜索多段导航.md):
-    #   1. 大范围螺旋搜索找到与 TSDF island 相交的最近可导航点
-    #   2. 导航到该点，每步融合地图（island 扩大）
-    #   3. 抵达后再次螺旋搜索，距离从 37→4 收敛
     cur_pts, cur_angle = pts.copy(), angle
     converged = False
     arrived_any = False
     map_h, map_w = tsdf_planner._tsdf_vol_cpu.shape[:2]
-    max_spiral_radius = max(map_h, map_w)  # search the entire map
-    from src.habitat import pose_habitat_to_tsdf
+    max_spiral_radius = max(map_h, map_w)
 
     for iteration in range(1, max_iterations + 1):
+        if step_budget is not None and gd_silent_step._step_counter >= step_budget:
+            logging.info(f"  GD iter {iteration}: step budget exhausted, stopping")
+            break
+
         logging.info(f"  GD iter {iteration}/{max_iterations}, pts={cur_pts.tolist()}")
 
         # 1. Refresh grids from current TSDF state
         tsdf_planner.refresh_planner_grids(cur_pts)
         island_sum = int(tsdf_planner.island.sum()) if tsdf_planner.island is not None else 0
-        unocc_sum = int(tsdf_planner.unoccupied.sum()) if tsdf_planner.unoccupied is not None else 0
-        logging.info(f"  GD iter {iteration}: island={island_sum} unoccupied={unocc_sum}")
+        logging.info(f"  GD iter {iteration}: island={island_sum} voxels")
 
         # 2. Check if target is already navigable (on island)
+        spiral_result = None
         tv_y, tv_x = target_voxel_xy
         if (0 <= tv_y < map_h and 0 <= tv_x < map_w
                 and tsdf_planner.island[tv_y, tv_x]):
             logging.info(f"  GD iter {iteration}: target on island, converging")
-            # Snap to get exact habitat pos
             normal_pos = tsdf_planner.voxel2normal(np.array([tv_y, tv_x]))
             normal_3d = np.array([normal_pos[0], normal_pos[1], floor_height])
             hab_pos = pos_normal_to_habitat(normal_3d)
             snapped = scene.pathfinder.snap_point(hab_pos[:3])
             if snapped is not None and not np.isnan(snapped).any():
-                cur_pts = snapped
+                spiral_result = {
+                    "habitat_pos": snapped,
+                    "voxel_xy": target_voxel_xy,
+                    "search_steps": 0,
+                    "spiral_dist": 0,
+                }
                 converged = True
+
+        # 3. Spiral search (if not already on island)
+        if spiral_result is None:
+            spiral_result = tsdf_planner.spiral_search_navigable_point(
+                pathfinder=scene.pathfinder,
+                target_voxel_xy=target_voxel_xy,
+                agent_habitat=cur_pts,
+                max_radius_voxels=max_spiral_radius,
+                floor_height=floor_height,
+            )
+            if spiral_result is None:
+                logging.warning(f"  GD iter {iteration}: spiral found nothing")
                 break
 
-        # 3. 大范围螺旋搜索：从 target voxel 出发找最近的 island 可导航点
-        spiral_result = tsdf_planner.spiral_search_navigable_point(
-            pathfinder=scene.pathfinder,
-            target_voxel_xy=target_voxel_xy,
-            agent_habitat=cur_pts,
-            max_radius_voxels=max_spiral_radius,
-            floor_height=floor_height,
-        )
-
-        if spiral_result is None:
-            logging.warning(
-                f"  GD iter {iteration}: spiral search found nothing "
-                f"(island={island_sum} voxels)")
-            # Fallback: use pathfinder.snap_point on target habitat position
-            target_habitat = pos_normal_to_habitat(target_normal)
-            snapped = scene.pathfinder.snap_point(target_habitat[:3])
-            if snapped is not None and not np.isnan(snapped).any():
-                logging.info(
-                    f"  GD iter {iteration}: pathfinder fallback to {snapped.tolist()}")
-                # Navigate toward this point via set_next_navigation_point
-                spiral_result = {
-                    "habitat_pos": snapped,
-                    "voxel_xy": tuple(
-                        tsdf_planner.habitat2voxel(snapped)[:2].tolist()),
-                    "search_steps": 0,
-                    "spiral_dist": 0,
-                }
-            else:
-                # Last resort: step toward target direction
-                direction = target_habitat - cur_pts
-                direction[1] = 0
-                dir_norm = np.linalg.norm(direction)
-                if dir_norm < 1e-3:
-                    break
-                direction = direction / dir_norm
-                step_target = cur_pts + direction * min(2.0, dir_norm * 0.5)
-                snapped = scene.pathfinder.snap_point(step_target[:3])
-                if snapped is None or np.isnan(snapped).any():
-                    logging.warning(f"  GD iter {iteration}: all fallbacks failed")
-                    break
-                spiral_result = {
-                    "habitat_pos": snapped,
-                    "voxel_xy": tuple(
-                        tsdf_planner.habitat2voxel(snapped)[:2].tolist()),
-                    "search_steps": 0,
-                    "spiral_dist": 0,
-                }
-
+        # 4. Convergence check
         spiral_dist = spiral_result["spiral_dist"]
-        nav_habitat = spiral_result["habitat_pos"]
         logging.info(
             f"  GD iter {iteration}: spiral dist={spiral_dist} "
             f"voxel={spiral_result['voxel_xy']}")
-
-        # 4. 收敛判断
         if spiral_dist <= converge_dist_voxels:
-            logging.info(f"  GD iter {iteration}: converged (dist<={converge_dist_voxels})")
-            cur_pts = nav_habitat.copy()
             converged = True
-            break
 
-        # 5. 导航到螺旋点 — 使用 target_type="image" 直接设置 habitat 位置
+        # 5. Set navigation point — use production code's target_type="image"
         tsdf_planner.max_point = None
         tsdf_planner.target_point = None
+        pathfinder_target = np.array(spiral_result["habitat_pos"])
         set_ok = tsdf_planner.set_next_navigation_point(
-            choice=nav_habitat, pts=cur_pts, objects=scene.objects,
+            target_type="image",
+            choice=pathfinder_target,
+            pts=cur_pts.tolist(),
+            objects=None,
             cfg=cfg.planner, pathfinder=scene.pathfinder,
-            target_type="image", observe_snapshot=False,
+            random_position=False, observe_snapshot=False,
         )
         if not set_ok:
-            logging.warning(
-                f"  GD iter {iteration}: set_next_navigation_point failed, "
-                f"teleporting to spiral point")
-            tsdf_planner.max_point = None
-            tsdf_planner.target_point = None
-            cur_pts = nav_habitat.copy()
-            continue
+            logging.error(f"  GD iter {iteration}: set_next_navigation_point failed")
+            break
 
-        # 6. 每步: agent_step → phase1 融合 → refresh_grids → update_frontier_map
+        # 6. Per-step navigation loop
         arrived = False
         for nav_step in range(1, max_nav_steps_per_iter + 1):
+            if step_budget is not None and gd_silent_step._step_counter >= step_budget:
+                break
+
             result = tsdf_planner.agent_step(
-                pts=cur_pts, angle=cur_angle, objects=scene.objects,
-                snapshots=scene.snapshots, pathfinder=scene.pathfinder,
-                cfg=cfg.planner, save_visualization=False,
+                pts=cur_pts, angle=cur_angle,
+                objects=scene.objects, snapshots=scene.snapshots,
+                pathfinder=scene.pathfinder, cfg=cfg.planner,
+                save_visualization=False,
             )
             if result[0] is None:
-                tsdf_planner.max_point = None
-                tsdf_planner.target_point = None
+                logging.warning(f"  GD iter {iteration} step {nav_step}: agent_step failed")
                 break
 
             cur_pts, cur_angle, _, _, _, target_arrived = result
 
-            # Per-step map integration: render phase-1 views + integrate TSDF
-            view_angles = [
-                cur_angle - np.pi / 3, cur_angle, cur_angle + np.pi / 3
-            ]
-            for va in view_angles:
-                vobs, vcam_pose = scene.get_observation(cur_pts, va)
-                tsdf_planner.integrate(
-                    color_im=vobs["color_sensor"],
-                    depth_im=vobs["depth_sensor"],
-                    cam_intr=cam_intr,
-                    cam_pose=pose_habitat_to_tsdf(vcam_pose),
-                    obs_weight=1.0,
-                    margin_h=int(cfg.margin_h_ratio * cfg.img_height),
-                    margin_w=int(cfg.margin_w_ratio * cfg.img_width),
-                    explored_depth=cfg.explored_depth,
-                )
+            # Per-step silent perception (scene graph + TSDF + snapshot)
+            gd_silent_step(
+                scene, tsdf_planner, cur_pts, cur_angle,
+                cnt_step_base + iteration * max_nav_steps_per_iter + nav_step,
+                memory_store, cam_intr, cfg,
+                detection_model, sam_predictor,
+                clip_model, clip_preprocess, clip_tokenizer,
+            )
 
-            # Refresh grids after integration so spiral search sees expanded map
+            # Refresh grids (map grows with new observations)
             tsdf_planner.refresh_planner_grids(cur_pts)
 
-            # Update frontier map (non-fatal)
+            # Update frontier map (includes room segmentation)
             try:
                 tsdf_planner.update_frontier_map(
-                    cur_pts, cfg.planner, scene, iteration * 100 + nav_step,
-                    save_frontier_image=False)
+                    cur_pts, cfg.planner, scene,
+                    cnt_step_base + iteration * max_nav_steps_per_iter + nav_step,
+                    save_frontier_image=False,
+                )
             except Exception as e:
                 logging.warning(f"  GD iter {iteration} step {nav_step}: update_frontier_map failed: {e}")
+
+            logging.info(
+                f"  GD iter {iteration} step {nav_step}: "
+                f"voxel={tsdf_planner.habitat2voxel(cur_pts)[:2].tolist()} "
+                f"arrived={target_arrived}")
 
             if target_arrived:
                 arrived = True
                 break
 
-        # Clear nav state
+        arrived_any = arrived or arrived_any
+
+        # Clear navigation state for next iteration
         tsdf_planner.max_point = None
         tsdf_planner.target_point = None
 
-        if arrived:
-            arrived_any = True
-            if not converged:
-                logging.info(
-                    f"  GD iter {iteration}: arrived at spiral point but not converged, "
-                    f"re-spiraling with expanded map...")
-                continue
+        # 7. Iteration termination logic
+        if converged and arrived:
+            logging.info(f"  GD: converged and arrived at iteration {iteration}")
+            break
+        if arrived and not converged:
+            logging.info(f"  GD iter {iteration}: arrived but not converged, re-spiraling")
+            continue
+        logging.info(f"  GD iter {iteration}: didn't arrive, continuing from current pos")
 
-    if converged:
-        return cur_pts, cur_angle, True, f"Reached target: {object_desc}", images, target_normal
-    if arrived_any:
-        return cur_pts, cur_angle, True, f"Near target: {object_desc}", images, target_normal
-    return cur_pts, cur_angle, False, f"GD navigation incomplete for '{object_desc}'", images, target_normal
+    status = f"GD nav: {'converged' if converged else 'not converged'}, arrived={arrived_any}"
+    return cur_pts, cur_angle, arrived_any, status, images

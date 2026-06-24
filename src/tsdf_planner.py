@@ -186,6 +186,16 @@ class TSDFPlanner(TSDFPlannerBase):
         self.unexplored_neighbors = unexplored_neighbors
         self.occupied_map_camera = occupied_map_camera
 
+        # Update room segmentation — MUST run before frontier detection
+        # (per MSGNav-main (2) ordering). When frontiers are empty, the
+        # function returns False early, but room_seg has already been applied.
+        if pts is not None:
+            room_cfg = self._cfg_get(cfg, "room_segmentation", None)
+            if room_cfg is not None:
+                room_success = self.update_room_map(cfg=room_cfg, pts=pts)
+            else:
+                room_success = self.update_room_map(cfg=cfg, pts=pts)
+
         # detect and update frontiers
         frontier_areas = np.argwhere(
             island
@@ -449,10 +459,6 @@ class TSDFPlanner(TSDFPlannerBase):
                 )
                 frontier.image = f"{cnt_step}_{i}.png"
                 frontier.feature = processed_rgb
-
-        # Update room segmentation
-        if pts is not None:
-            room_success = self.update_room_map(cfg=cfg, pts=pts)
 
         return True
 

@@ -64,6 +64,21 @@ planner:
   min_frontier_area: 20  # the frontier should have at least this many pixels
   max_frontier_angle_range_deg: 150  # the angle spanned by the pixels in a frontier should not be larger than this
   region_equal_threshold: 0.95
+  room_segmentation:
+    area_source: navigable
+    segmentation_method: dilation_watershed
+    min_snapshots: 0
+    visualize_on_topdown: true
+    visualization_alpha: 0.35
+    min_room_area: 16
+    observed_ratio_threshold: 0.30
+    max_unobserved_room_hops: 1
+    room_adjacency_dilation: 1
+    seed_area_min: 6
+    seed_area_max: 400
+    max_dilation_iter: 80
+    stable_iou_threshold: 0.2
+    close_iterations: 1
 
 # about scene graph construction
 scene_graph:

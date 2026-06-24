@@ -654,6 +654,71 @@ def get_random_snapshot_observation_point(
     return target_obs_point
 
 
+def bresenham_2d(start, end):
+    """Bresenham line algorithm on 2D grid.
+
+    Args:
+        start: (y, x) tuple or array
+        end: (y, x) tuple or array
+    Returns:
+        List of (y, x) tuples from start to end inclusive.
+    """
+    y0, x0 = int(start[0]), int(start[1])
+    y1, x1 = int(end[0]), int(end[1])
+    points = []
+    dy = abs(y1 - y0)
+    dx = abs(x1 - x0)
+    sy = 1 if y0 < y1 else -1
+    sx = 1 if x0 < x1 else -1
+    err = dx - dy
+    while True:
+        points.append((y0, x0))
+        if y0 == y1 and x0 == x1:
+            break
+        e2 = 2 * err
+        if e2 > -dy:
+            err -= dy
+            x0 += sx
+        if e2 < dx:
+            err += dx
+            y0 += sy
+    return points
+
+
+def check_ray_blocked(tsdf_planner, agent_pos, target_pos, min_blocking_height=1.2):
+    """Check if ray from agent to target is blocked by tall obstacles.
+
+    Only obstacles taller than min_blocking_height are considered blocking.
+    Tables (0.75m), chairs (0.5m) don't block; walls (2.4m+), cabinets (1.8m) do.
+
+    Args:
+        tsdf_planner: TSDFPlanner with _tsdf_vol_cpu, _voxel_size, min_height_voxel, habitat2voxel
+        agent_pos: 3D habitat position [x, y, z]
+        target_pos: 3D habitat position [x, y, z]
+        min_blocking_height: height threshold in meters (default 1.2m)
+    Returns:
+        True if blocked, False if clear.
+    """
+    agent_voxel = tsdf_planner.habitat2voxel(agent_pos)
+    target_voxel = tsdf_planner.habitat2voxel(target_pos)
+
+    ray_voxels = bresenham_2d(agent_voxel[:2], target_voxel[:2])
+
+    voxel_size = tsdf_planner._voxel_size
+    floor_z = tsdf_planner.min_height_voxel
+    min_block_z = floor_z + int(min_blocking_height / voxel_size)
+    max_z = tsdf_planner._tsdf_vol_cpu.shape[2]
+    H, W = tsdf_planner._tsdf_vol_cpu.shape[:2]
+
+    for vy, vx in ray_voxels[1:-1]:  # skip endpoints (agent and target)
+        if not (0 <= vy < H and 0 <= vx < W):
+            return True  # out of bounds = blocked
+        column = tsdf_planner._tsdf_vol_cpu[vy, vx, min_block_z:max_z]
+        if (column < -0.1).any():  # TSDF < 0 = behind surface = occupied
+            return True
+    return False
+
+
 def get_near_navigable_point(p, pathfinder, radius=0.2):
     # p: [3] array in habitat coordinate
     # radius: the radius for searching the navigable point

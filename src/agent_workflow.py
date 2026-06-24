@@ -18,11 +18,7 @@ import numpy as np
 from typing import List, Optional, Tuple, Dict
 
 from src.agent_context import ContextManager
-from src.agent_evidence import TrajectoryEvidence
-from src.agent_executor import Executor
 from src.agent_memory import MemoryStore
-from src.agent_notebook import EvidenceNotebook
-from src.agent_planner import Planner, PLANNER_SYSTEM_PROMPT
 from src.agent_tools import (
     silent_perception_step,
     observe_panorama,
@@ -34,6 +30,7 @@ from src.agent_tools import (
     submit_answer,
 )
 from src.agent_image_utils import numpy_to_base64, make_mosaic
+from src.seed_views import SeedViewManager
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +62,18 @@ def call_vlm(
 
     # Build the last message with optional image
     last_msg = api_messages[-1]
-    if image_b64:
-        content_list = [
-            {"type": "image_url", "image_url": {
-                "url": f"data:image/png;base64,{image_b64}"}},
-            {"type": "text", "text": last_msg["content"]},
-        ]
-        api_messages[-1] = {"role": last_msg["role"], "content": content_list}
+    # Handle numpy array input (convert to base64)
+    if image_b64 is not None:
+        if isinstance(image_b64, np.ndarray):
+            from src.agent_image_utils import numpy_to_base64
+            image_b64 = numpy_to_base64(image_b64)
+        if image_b64:  # now it's a string (or empty)
+            content_list = [
+                {"type": "image_url", "image_url": {
+                    "url": f"data:image/png;base64,{image_b64}"}},
+                {"type": "text", "text": last_msg["content"]},
+            ]
+            api_messages[-1] = {"role": last_msg["role"], "content": content_list}
 
     payload = {
         "model": model_name,
@@ -129,7 +131,7 @@ SYSTEM_PROMPT = """You are an embodied navigation agent searching for the answer
 You operate in a 6-stage workflow. In each stage you have specific goals and tools available.
 
 Available tools:
-- observe_panorama: Take a 7-view panorama. Returns a mosaic image showing all directions and room/frontier information.
+- observe_panorama: Take an 8-view panorama. Returns a mosaic image showing all directions and room/frontier information.
 - view_direction <direction>: Look toward "left", "right", "forward", or "backward". Returns the RGB image from that direction.
 - navigate_to_object <object_description>: Use GroundingDINO to detect the described object and navigate toward it. Returns success/failure and status. The <object_description> MUST be a concrete noun phrase that GroundingDINO can detect, e.g. "oven", "the red door", "towel hanging on oven handle", "coffee table". Do NOT use room names, directions, or abstract concepts — only physical objects.
 - navigate_to_seed <room_id>: Navigate toward the center of the specified room (e.g. "1").
@@ -155,79 +157,112 @@ Stage transition guide:
 - Stage 6: call submit_answer.
 """
 
-STAGE1_PROMPT = """Stage 1: Initial Exploration
+# ── VLM Output Schema (shared across stages) ──
+# Note: braces are escaped ({{ }}) so .format() doesn't treat them as placeholders
+SCHEMA_REQUIREMENT = """
+You MUST output the following JSON format (output nothing else):
+{{
+  "reason": "<one sentence explaining your choice, must include specific visual clues you observed>",
+  ...action-specific fields...
+}}
 
-You are at the starting position. First, call observe_panorama to look around and understand your surroundings. Based on the panorama, identify:
-1. What rooms you can see
-2. What objects are visible
-3. What unexplored areas (frontiers) exist
-
-Describe what you see and which direction you think is most promising for finding the answer to: "{question}"
+reason field requirements:
+- Must include specific visual clues you observed from the image (e.g. "I see a stainless steel appliance in view3")
+- Must explain how this choice helps answer the question
+- Vague statements like "I decided to..." are NOT allowed; you must provide concrete evidence
 """
 
-STAGE2_PROMPT = """Stage 2: Direction Judgment
+STAGE1_PROMPT = """Stage 1: Initial Exploration
 
-Based on the panorama you just observed, look at the objects and rooms visible. 
+You are at the starting position. Call observe_panorama to look around.
+Based on the panorama, describe what you see and which direction is most promising.
+
+Question: "{question}"
+"""
+
+STAGE2_PROMPT = """Stage 2: Main Direction Decision
+
+Look at the 8-view panorama above. The views are labeled:
+  view0=front view1=front-right view2=right view3=back-right view4=back view5=back-left view6=left view7=front-left
 
 For the question: "{question}"
 
-Do you see the target objects or relevant clues in the current view?
-- If YES: Call navigate_to_object with a SPECIFIC physical object name (e.g. "oven", "the red door", "towel"). The argument must be a concrete noun phrase a detector can find — NOT a room name, direction, or abstract concept.
-- If NO: Call navigate_to_frontier or navigate_to_seed to explore unexplored areas.
+Decide:
+- If you see a relevant object in one of the views -> navigate_to_object with view_idx
+- If no relevant object visible in any view -> explore_other_room
+""" + SCHEMA_REQUIREMENT + """
 
-Available rooms: {rooms_info}
-Available frontiers: {frontiers_info}
+Actions:
+1. navigate_to_object: {{"reason": "...", "action": "navigate_to_object", "view_idx": <0-7>}}
+2. explore_other_room: {{"reason": "...", "action": "explore_other_room"}}
 """
 
-STAGE3_PROMPT = """Stage 3: Targeted Navigation
+STAGE2_5A_PROMPT = """Stage 2.5a: Seed Selection
 
-You are looking for objects relevant to: "{question}"
+You decided to explore other rooms. Here are the available unexplored seeds
+(each image shows the view from your current position toward that seed):
 
-Based on what you observed in the panorama, identify the specific physical object that is most likely to help answer the question. Then call navigate_to_object with a concrete noun phrase describing that object.
+{seed_info}
 
-IMPORTANT: The argument to navigate_to_object must be a specific physical object name that a detector can find in an image. Examples:
-- GOOD: "oven", "the red door", "towel", "coffee table", "kitchen counter"
-- BAD: "forward", "room 1", "the kitchen", "explore", "left side"
+For the question: "{question}"
 
-If you cannot identify a specific object to navigate to, use view_direction to look around, or navigate_to_frontier / navigate_to_seed to explore other areas.
+Decide:
+- If a seed seems relevant -> explore_seed with seed_id
+- If all seeds seem irrelevant -> explore_frontier (fallback)
+""" + SCHEMA_REQUIREMENT + """
 
-Available rooms: {rooms_info}
-Available frontiers: {frontiers_info}
+Actions:
+1. explore_seed: {{"reason": "...", "action": "explore_seed", "seed_id": <id>}}
+2. explore_frontier: {{"reason": "...", "action": "explore_frontier"}}
 """
 
-STAGE4_PROMPT = """Stage 4: Final Exploration
+STAGE3_PROMPT = """Stage 3: Object Selection
 
-You've explored several areas but haven't found the answer yet. 
+You selected view_idx {view_idx}. Here is the large image of that view.
 
-Question: "{question}"
+For the question: "{question}"
 
-Choose which room or frontier to explore next. Consider:
-- Which rooms have you not fully explored?
-- Which frontiers seem most promising?
+You MUST output ONE concrete physical object name visible in this image that
+will serve as your navigation anchor. The object must be:
+- A concrete noun phrase a detector can find (e.g. "oven", "the red door", "towel")
+- NOT a room name, direction, or abstract concept
+""" + SCHEMA_REQUIREMENT + """
 
-Available rooms: {rooms_info}
-Available frontiers: {frontiers_info}
+Output: {{"reason": "...", "object": "<object_name>"}}
 """
 
-STAGE5_PROMPT = """Stage 5: Memory Fallback
+STAGE5_PROMPT = """Stage 5: Re-decision After Arrival
 
-You've explored extensively but still need to answer: "{question}"
+You've arrived near the target. Here are the 3 frontal views from your
+current position (left 60°, front, right 60°):
+  view0=left view1=front view2=right
 
-You can use query_memory to search past observations. You have a limited number of queries remaining.
-The query result will be shown to you as an image on the next turn.
+For the question: "{question}"
 
-If you think you have enough information, use submit_answer to provide your answer.
-If you truly cannot find the answer, submit "unanswerable".
-When ready to answer, set next_stage to 6.
+Decide:
+- If you can answer the question now -> submit_answer
+- If you see a new relevant object in one of the 3 views -> navigate_to_object
+- If you need to explore other rooms -> explore_other_room
+""" + SCHEMA_REQUIREMENT + """
+
+Actions:
+1. navigate_to_object: {{"reason": "...", "action": "navigate_to_object", "view_idx": <0-2>}}
+2. explore_other_room: {{"reason": "...", "action": "explore_other_room"}}
+3. submit_answer: {{"reason": "...", "action": "submit_answer", "answer": "<your_answer>"}}
 """
 
-STAGE6_PROMPT = """Stage 6: Submit Answer
+STAGE6_PROMPT = """Stage 6: Frontier Selection
 
-Based on all observations and reasoning, submit your final answer.
+You decided to explore frontiers. Here are all available frontiers:
 
-Question: "{question}"
+{frontier_info}
 
-Respond with submit_answer and your answer.
+For the question: "{question}"
+
+Select the most promising frontier to explore next.
+""" + SCHEMA_REQUIREMENT + """
+
+Output: {{"reason": "...", "frontier_id": <id>}}
 """
 
 
@@ -354,237 +389,318 @@ def run_episode(
     stages_completed = 0
 
     try:
-        # ═══════ STAGE 1: Initial Panorama ═══════
+        # ═══ STAGE 1: 8-View Panorama ═══
         logger.info("--- Stage 1: Initial Panorama ---")
-        context.start_stage(1)
-
-        pts, angle, mosaic_b64, pano_text = observe_panorama(
+        pts, angle, mosaic_b64, pano_text, panorama_views = observe_panorama(
             scene, tsdf_planner, pts, angle, total_steps,
             memory_store, cam_intr, cfg, detection_model,
             sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
         )
         total_steps += 1
 
-        # Build rooms/frontiers info string
-        rooms_info = _format_rooms_info(tsdf_planner)
-        frontiers_info = _format_frontiers_info(tsdf_planner)
+        # SeedViewManager: register seeds from current frontier/room map
+        seed_view_manager = SeedViewManager()
+        if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
+            logger.info(f"Stage 1: found {len(tsdf_planner.room_regions)} rooms")
+            _register_new_seeds(seed_view_manager, tsdf_planner, scene, pts)
+            logger.info(f"Stage 1: registered {len(seed_view_manager.seeds)} seeds")
+        else:
+            logger.info("Stage 1: no room_regions found (room segmentation may have failed)")
 
-        s1_msg = STAGE1_PROMPT.format(question=question)
-        context.add_message("system", SYSTEM_PROMPT)
-        context.add_message("user", pano_text + "\n" + s1_msg)
-        context.add_image(mosaic_b64)
-
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": pano_text + "\n" + s1_msg},
-        ]
-        vlm_response = call_vlm(messages, image_b64=mosaic_b64)
-        vlm_parsed = _parse_vlm_response(vlm_response)
-        context.add_message("assistant", vlm_response)
-        stages_completed = 1
-        logger.info(f"Stage 1 VLM: {vlm_parsed}")
-
-        # Determine next stage from VLM (default 2)
-        current_stage = int(vlm_parsed.get("next_stage", 2) or 2)
-        context.transition(current_stage, vlm_parsed.get("reasoning", "Stage 1 done"))
-
-        # ═══════ STAGE 2-5: Exploration Loop (non-linear) ═══════
-        # 决策节奏：VLM 只在导航抵达目标后才被唤醒做下一次决策（类似 choose_every_step=false）。
-        # 导航工具内部循环 agent_step 直到抵达，每子步做 silent_perception。
-        # max_total_steps 限制的是底层步数（silent_perception 次数），不是 VLM 决策次数。
-        stage_visit_count = {}
-        max_stage_visits = {2: 3, 3: 6, 4: 4, 5: 2}
-        max_stage_decisions = 8  # 每阶段最多 VLM 决策次数
+        # ═══ STAGE 2-6: 6-Stage State Machine ═══
+        current_stage = 2
+        consecutive_missing_reason = 0
+        max_vlm_calls = max_total_steps // 2
 
         def _low_level_steps():
             return silent_perception_step._step_counter
 
-        while current_stage in (2, 3, 4, 5) and _low_level_steps() < max_total_steps:
-            stage_visit_count[current_stage] = stage_visit_count.get(current_stage, 0) + 1
-            if stage_visit_count[current_stage] > max_stage_visits.get(current_stage, 3):
-                logger.info(f"Stage {current_stage} visited too many times, forcing advance")
-                current_stage = min(current_stage + 1, 5)
-                continue
+        vlm_call_count = 0
 
-            logger.info(f"--- Stage {current_stage} (visit {stage_visit_count[current_stage]}) ---")
-            context.start_stage(current_stage)
-
-            # Build stage prompt
+        while current_stage != "done" and _low_level_steps() < max_total_steps:
             if current_stage == 2:
-                stage_prompt = STAGE2_PROMPT.format(
-                    question=question, rooms_info=rooms_info,
-                    frontiers_info=frontiers_info)
-            elif current_stage == 3:
-                stage_prompt = STAGE3_PROMPT.format(
-                    question=question, rooms_info=rooms_info,
-                    frontiers_info=frontiers_info)
-            elif current_stage == 4:
-                stage_prompt = STAGE4_PROMPT.format(
-                    question=question, rooms_info=rooms_info,
-                    frontiers_info=frontiers_info)
-            else:  # stage 5
-                stage_prompt = STAGE5_PROMPT.format(question=question)
-
-            context.add_message("user", stage_prompt)
-
-            stage_decisions = 0
-            next_stage = None
-
-            while stage_decisions < max_stage_decisions and _low_level_steps() < max_total_steps:
-                messages = _build_messages(context)
-                last_img = context.stage_images[-1] if context.stage_images else None
-                vlm_response = call_vlm(messages, image_b64=last_img)
-                context.add_message("assistant", vlm_response)
-
-                stage_decisions += 1
-                total_steps += 1  # VLM-turn counter (for naming/logging only)
-
+                # ── Stage 2: Main Direction Decision (VLM call 1) ──
+                logger.info("--- Stage 2: Main Direction Decision ---")
+                stage_prompt = STAGE2_PROMPT.format(question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": pano_text + "\n" + stage_prompt},
+                ]
+                vlm_response = call_vlm(messages, image_b64=mosaic_b64)
+                vlm_call_count += 1
                 vlm_parsed = _parse_vlm_response(vlm_response)
-                tool = vlm_parsed.get("tool", "")
-                args = vlm_parsed.get("arguments", "")
-                reasoning = vlm_parsed.get("reasoning", "")
 
-                logger.info(f"Stage {current_stage} decision {stage_decisions} (low-level steps={_low_level_steps()}): tool={tool}, args={args}")
-
-                # Validate navigate_to_object has a concrete object description
-                if tool == "navigate_to_object":
-                    if not _is_valid_object_desc(args):
-                        logger.warning(f"Invalid object description for navigate_to_object: '{args}'")
-                        context.add_message("user",
-                            f"ERROR: navigate_to_object requires a concrete physical object name "
-                            f"(e.g. 'oven', 'the red door', 'towel'). "
-                            f"You provided: '{args}'. "
-                            f"Please call navigate_to_object again with a specific object name, "
-                            f"or use a different tool (view_direction, navigate_to_frontier, navigate_to_seed).")
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 2: 2x missing_reason, fallback to explore_other_room")
+                        current_stage = "2.5a"
+                        consecutive_missing_reason = 0
                         continue
+                    continue
 
-                # Check for answer submission
+                consecutive_missing_reason = 0
+                logger.info(f"Stage 2 VLM: {vlm_parsed}")
+
+                if vlm_parsed.get("tool") == "navigate_to_object":
+                    view_idx = vlm_parsed.get("view_idx", 0)
+                    if view_idx is None:
+                        view_idx = 0
+                    view_idx = int(view_idx)
+                    view_idx = max(0, min(view_idx, len(panorama_views) - 1))
+                    view_info = panorama_views[view_idx]
+                    # Store view info for Stage 3
+                    pending_view = {
+                        "view_idx": view_idx,
+                        "angle": view_info["angle"],
+                        "cam_pose": view_info["cam_pose"],
+                        "rgb": view_info["rgb"],
+                    }
+                    current_stage = 3
+                else:
+                    current_stage = "2.5a"
+
+            elif current_stage == "2.5a":
+                # ── Stage 2.5a: Seed Selection (VLM call 2) ──
+                logger.info("--- Stage 2.5a: Seed Selection ---")
+                explored_seed_ids = set()
+                seed_ids = seed_view_manager.get_unexplored_seed_ids(explored_seed_ids)
+
+                if not seed_ids:
+                    logger.info("Stage 2.5a: no seeds available, fallback to frontier")
+                    current_stage = 6
+                    continue
+
+                seed_mosaic = seed_view_manager.get_mosaic(question)
+                seed_info = f"Available seeds: {seed_ids}"
+                stage_prompt = STAGE2_5A_PROMPT.format(
+                    seed_info=seed_info, question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": stage_prompt},
+                ]
+                vlm_response = call_vlm(messages, image_b64=seed_mosaic)
+                vlm_call_count += 1
+                vlm_parsed = _parse_vlm_response(vlm_response)
+
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 2.5a: 2x missing_reason, fallback to frontier")
+                        current_stage = 6
+                        consecutive_missing_reason = 0
+                        continue
+                    continue
+
+                consecutive_missing_reason = 0
+                logger.info(f"Stage 2.5a VLM: {vlm_parsed}")
+
+                if vlm_parsed.get("tool") == "explore_seed":
+                    seed_id = vlm_parsed.get("seed_id", seed_ids[0])
+                    if seed_id is None:
+                        seed_id = seed_ids[0]
+                    seed_id = int(seed_id)
+                    step_budget = max_total_steps - _low_level_steps()
+                    pts, angle, success, status, obs_image = navigate_to_seed(
+                        scene, tsdf_planner, pts, angle, seed_id, cfg,
+                        memory_store, cam_intr, detection_model, sam_predictor,
+                        clip_model, clip_preprocess, clip_tokenizer, total_steps,
+                        step_budget=step_budget,
+                        seed_view_manager=seed_view_manager,
+                        active_seed_ids=[sid for sid in seed_view_manager.seeds],
+                    )
+                    total_steps += 1
+                    # Register any new seeds discovered after navigation
+                    _register_new_seeds(seed_view_manager, tsdf_planner, scene, pts)
+                    current_stage = 5
+                else:
+                    current_stage = 6
+
+            elif current_stage == 3:
+                # ── Stage 3: Object Selection (VLM call 3) ──
+                logger.info("--- Stage 3: Object Selection ---")
+                rgb = pending_view["rgb"]
+                stage_prompt = STAGE3_PROMPT.format(
+                    view_idx=pending_view["view_idx"], question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": stage_prompt},
+                ]
+                vlm_response = call_vlm(messages, image_b64=numpy_to_base64(rgb))
+                vlm_call_count += 1
+                vlm_parsed = _parse_vlm_response(vlm_response)
+
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 3: 2x missing_reason, fallback to explore_other_room")
+                        current_stage = "2.5a"
+                        consecutive_missing_reason = 0
+                        continue
+                    continue
+
+                consecutive_missing_reason = 0
+                object_desc = vlm_parsed.get("object", "")
+
+                if not _is_valid_object_desc(object_desc):
+                    logger.warning(f"Stage 3: invalid object '{object_desc}', retrying")
+                    continue
+
+                logger.info(f"Stage 3: object='{object_desc}'")
+
+                # ── Stage 4: GD Navigation (code, no VLM) ──
+                step_budget = max_total_steps - _low_level_steps()
+                pts, angle, success, status, _ = navigate_to_object(
+                    scene, tsdf_planner, pts, angle,
+                    view_idx=pending_view["view_idx"],
+                    view_angle=pending_view["angle"],
+                    view_cam_pose=pending_view["cam_pose"],
+                    object_desc=object_desc,
+                    memory_store=memory_store, cam_intr=cam_intr, cfg=cfg,
+                    detection_model=detection_model, sam_predictor=sam_predictor,
+                    clip_model=clip_model, clip_preprocess=clip_preprocess,
+                    clip_tokenizer=clip_tokenizer, cnt_step=total_steps,
+                    step_budget=step_budget,
+                )
+                total_steps += 1
+                current_stage = 5
+
+            elif current_stage == 5:
+                # ── Stage 5: Re-decision After Arrival (VLM call 4) ──
+                logger.info("--- Stage 5: Re-decision After Arrival ---")
+                # Render 3 frontal views (left 60°, front, right 60°) at current position
+                obs_angles = [angle - np.pi / 3, angle, angle + np.pi / 3]
+                frontal_views = []
+                frontal_rgb = []
+                for i, ang in enumerate(obs_angles):
+                    obs, cam_pose = scene.get_observation(pts, ang)
+                    rgb = obs["color_sensor"][..., :3]
+                    frontal_rgb.append(rgb)
+                    frontal_views.append({
+                        "view_idx": i,
+                        "angle": float(ang),
+                        "cam_pose": cam_pose,
+                        "rgb": rgb,
+                    })
+
+                # Build 3-view mosaic
+                mosaic_3 = make_mosaic(frontal_rgb, target_h=300)
+
+                stage_prompt = STAGE5_PROMPT.format(question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": stage_prompt},
+                ]
+                vlm_response = call_vlm(messages, image_b64=mosaic_3)
+                vlm_call_count += 1
+                vlm_parsed = _parse_vlm_response(vlm_response)
+
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 5: 2x missing_reason, fallback to submit_answer")
+                        answer = vlm_parsed.get("answer", "unanswerable")
+                        result["answer"] = answer
+                        result["success"] = True
+                        result["steps_taken"] = _low_level_steps()
+                        result["stages_completed"] = 5
+                        current_stage = "done"
+                        break
+                    continue
+
+                consecutive_missing_reason = 0
+                logger.info(f"Stage 5 VLM: {vlm_parsed}")
+
+                tool = vlm_parsed.get("tool", "")
                 if tool == "submit_answer":
-                    answer = vlm_parsed.get("answer", args)
-                    logger.info(f"Answer submitted in stage {current_stage}: {answer}")
+                    answer = vlm_parsed.get("answer", "unanswerable")
                     result["answer"] = answer
                     result["success"] = True
                     result["steps_taken"] = _low_level_steps()
-                    result["stages_completed"] = current_stage
-                    return result
-
-                # Step budget for navigation tools — prevents overshooting max_total_steps
-                step_budget = max_total_steps - _low_level_steps()
-
-                # Execute tool — navigation tools run to arrival internally, VLM wakes after
-                obs_text = ""
-                obs_image = None
-
-                if tool == "observe_panorama":
-                    pts, angle, obs_image, obs_text = observe_panorama(
-                        scene, tsdf_planner, pts, angle, total_steps,
-                        memory_store, cam_intr, cfg, detection_model,
-                        sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-                    )
-                    rooms_info = _format_rooms_info(tsdf_planner)
-                    frontiers_info = _format_frontiers_info(tsdf_planner)
-                    obs_text += f"\n{rooms_info}\n{frontiers_info}"
-
-                elif tool == "view_direction":
-                    pts, angle, obs_image = view_direction(
-                        scene, tsdf_planner, pts, angle, args,
-                        memory_store, cam_intr, cfg, detection_model,
-                        sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-                        total_steps,
-                    )
-                    obs_text = f"Viewed direction: {args}"
-
+                    result["stages_completed"] = 5
+                    current_stage = "done"
                 elif tool == "navigate_to_object":
-                    pts, angle, success, status, obs_image = navigate_to_object(
-                        scene, tsdf_planner, pts, angle, args,
-                        memory_store, cam_intr, cfg, detection_model,
-                        sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-                        total_steps, step_budget=step_budget,
-                    )
-                    obs_text = f"navigate_to_object: success={success}, status={status}"
-                    rooms_info = _format_rooms_info(tsdf_planner)
-                    frontiers_info = _format_frontiers_info(tsdf_planner)
-                    obs_text += f"\n{rooms_info}\n{frontiers_info}"
-
-                elif tool == "navigate_to_seed":
-                    try:
-                        room_id = int(args)
-                    except (ValueError, TypeError):
-                        room_id = 0
-                    pts, angle, success, status, obs_image = navigate_to_seed(
-                        scene, tsdf_planner, pts, angle, room_id, cfg,
-                        memory_store, cam_intr, detection_model, sam_predictor,
-                        clip_model, clip_preprocess, clip_tokenizer, total_steps,
-                        step_budget=step_budget,
-                    )
-                    obs_text = f"navigate_to_seed: success={success}, status={status}"
-                    rooms_info = _format_rooms_info(tsdf_planner)
-                    frontiers_info = _format_frontiers_info(tsdf_planner)
-                    obs_text += f"\n{rooms_info}\n{frontiers_info}"
-
-                elif tool == "navigate_to_frontier":
-                    try:
-                        frontier_id = int(args)
-                    except (ValueError, TypeError):
-                        frontier_id = 0
-                    pts, angle, success, status, obs_image = navigate_to_frontier(
-                        scene, tsdf_planner, pts, angle, frontier_id, cfg,
-                        memory_store, cam_intr, detection_model, sam_predictor,
-                        clip_model, clip_preprocess, clip_tokenizer, total_steps,
-                        step_budget=step_budget,
-                    )
-                    obs_text = f"navigate_to_frontier: success={success}, status={status}"
-                    rooms_info = _format_rooms_info(tsdf_planner)
-                    frontiers_info = _format_frontiers_info(tsdf_planner)
-                    obs_text += f"\n{rooms_info}\n{frontiers_info}"
-
-                elif tool == "query_memory":
-                    obs_image = query_memory(memory_store, args)
-                    obs_text = f"Memory query for: {args}" if obs_image else "Memory query returned no results or quota exhausted"
-
+                    view_idx = vlm_parsed.get("view_idx", 1)
+                    if view_idx is None:
+                        view_idx = 1
+                    view_idx = int(view_idx)
+                    view_idx = max(0, min(view_idx, len(frontal_views) - 1))
+                    view_info = frontal_views[view_idx]
+                    pending_view = {
+                        "view_idx": view_idx,
+                        "angle": view_info["angle"],
+                        "cam_pose": view_info["cam_pose"],
+                        "rgb": view_info["rgb"],
+                    }
+                    current_stage = 3
+                elif tool == "explore_other_room":
+                    current_stage = "2.5a"
                 else:
-                    obs_text = f"Tool '{tool}' not recognized."
+                    # Unknown action -> fallback to explore_other_room
+                    current_stage = "2.5a"
 
-                # Provide observation back to VLM (VLM wakes up here after navigation arrival)
-                context.add_message("user", f"Observation: {obs_text}")
-                if obs_image:
-                    context.add_image(obs_image)
+            elif current_stage == 6:
+                # ── Stage 6: Frontier Selection (VLM call 5) ──
+                logger.info("--- Stage 6: Frontier Selection ---")
+                frontier_info = _format_frontiers_info(tsdf_planner)
+                stage_prompt = STAGE6_PROMPT.format(
+                    frontier_info=frontier_info, question=question)
+                messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": stage_prompt},
+                ]
+                # Use frontier visualization if available
+                frontier_img = None
+                if hasattr(tsdf_planner, '_last_frontier_image') and tsdf_planner._last_frontier_image is not None:
+                    frontier_img = numpy_to_base64(tsdf_planner._last_frontier_image)
 
-                # Check explicit next_stage transition from VLM
-                ns = vlm_parsed.get("next_stage")
-                if ns is not None:
-                    try:
-                        next_stage = int(ns)
-                    except (ValueError, TypeError):
-                        next_stage = None
-                    if next_stage in (1, 2, 3, 4, 5, 6) and next_stage != current_stage:
-                        break
+                vlm_response = call_vlm(messages, image_b64=frontier_img)
+                vlm_call_count += 1
+                vlm_parsed = _parse_vlm_response(vlm_response)
 
-            # Stage transition summary
-            summary = vlm_parsed.get("reasoning", f"Stage {current_stage} completed")
-            target_stage = next_stage if next_stage is not None else min(current_stage + 1, 6)
-            context.transition(target_stage, summary)
-            stages_completed = current_stage
-            current_stage = target_stage
+                if vlm_parsed.get("tool") == "missing_reason":
+                    consecutive_missing_reason += 1
+                    if consecutive_missing_reason >= 2:
+                        logger.info("Stage 6: 2x missing_reason, fallback to frontier 0")
+                        vlm_parsed = {"tool": "explore_frontier", "frontier_id": 0, "reason": "fallback"}
+                        consecutive_missing_reason = 0
+                    else:
+                        continue
 
-        # ═══════ STAGE 6: Final Answer ═══════
-        if not answer:
+                frontier_id = vlm_parsed.get("frontier_id", 0)
+                if frontier_id is None:
+                    frontier_id = 0
+                frontier_id = int(frontier_id)
+                step_budget = max_total_steps - _low_level_steps()
+                pts, angle, success, status, obs_image = navigate_to_frontier(
+                    scene, tsdf_planner, pts, angle, frontier_id, cfg,
+                    memory_store, cam_intr, detection_model, sam_predictor,
+                    clip_model, clip_preprocess, clip_tokenizer, total_steps,
+                    step_budget=step_budget,
+                    seed_view_manager=seed_view_manager,
+                    active_seed_ids=[sid for sid in seed_view_manager.seeds],
+                )
+                total_steps += 1
+                # Register any new seeds discovered after navigation
+                _register_new_seeds(seed_view_manager, tsdf_planner, scene, pts)
+                current_stage = 5
+
+        # ═══ Final Answer (Stage 6 fallback) ═══
+        if not answer and current_stage != "done":
             logger.info("--- Stage 6: Submit Answer ---")
-            context.start_stage(6)
-
-            s6_prompt = STAGE6_PROMPT.format(question=question)
-            context.add_message("user", s6_prompt)
-
-            messages = _build_messages(context)
+            stage_prompt = STAGE6_PROMPT.format(question=question)
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": stage_prompt},
+            ]
             vlm_response = call_vlm(messages)
             vlm_parsed = _parse_vlm_response(vlm_response)
-
             answer = vlm_parsed.get("answer", vlm_parsed.get("arguments", "unanswerable"))
             logger.info(f"Final answer: {answer}")
 
             result["answer"] = answer
             result["success"] = "unanswerable" not in answer.lower()
-            result["steps_taken"] = silent_perception_step._step_counter
+            result["steps_taken"] = _low_level_steps()
             result["stages_completed"] = 6
 
     except Exception as e:
@@ -604,266 +720,44 @@ def run_episode(
     return result
 
 
-# ── Two-Tier Planner-Executor Workflow ───────────────────────────────────
+def _register_new_seeds(seed_view_manager, tsdf_planner, scene, agent_pts):
+    """Scan room_regions and register any new seeds not yet in SeedViewManager.
 
-def run_episode_two_tier(
-    scene_id: str,
-    question: str,
-    question_id: str,
-    cfg,
-    detection_model,
-    sam_predictor,
-    clip_model,
-    clip_preprocess,
-    clip_tokenizer,
-    output_dir: str = "/root/MyAgent/results/hmge",
-    max_planner_rounds: int = 10,
-    max_total_steps: int = 50,
-    start_pts: Optional[np.ndarray] = None,
-    start_angle: float = 0.0,
-) -> Dict:
-    """Two-tier Planner-Executor episode loop.
-
-    Returns: dict with keys:
-        scene_id, question_id, question, answer, success, steps_taken,
-        rounds_used, error
+    A seed is any room OTHER than the one the agent is currently in.
+    room_state can be 'observed', 'hypothesis', or 'unknown' — all are
+    valid seeds (we want to navigate to other rooms to explore them).
     """
-    import habitat_sim
-    from src.scene_aeqa import Scene
     from src.habitat import pos_normal_to_habitat
-    from src.tsdf_planner import TSDFPlanner
-    from src.const import QWEN_PLANNER_API_KEY, QWEN_PLANNER_BASE_URL
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    logger.info(f"=== Two-Tier Episode {question_id}: {scene_id} ===")
-    logger.info(f"Question: {question}")
-
-    result = {
-        "scene_id": scene_id,
-        "question_id": question_id,
-        "question": question,
-        "answer": "",
-        "success": False,
-        "steps_taken": 0,
-        "rounds_used": 0,
-        "error": "",
-    }
-
-    scene = None
-    tsdf_planner = None
-    notebook = EvidenceNotebook()
-    planner = Planner(api_key=QWEN_PLANNER_API_KEY, base_url=QWEN_PLANNER_BASE_URL)
-    executor = None
-
-    try:
-        from src.agent_tools import silent_perception_step
-        silent_perception_step._last_pos = None
-        silent_perception_step._step_counter = -1
-
-        import yaml
-        from omegaconf import OmegaConf, DictConfig
-
-        if isinstance(cfg, dict):
-            cfg = OmegaConf.create(cfg)
-        elif hasattr(cfg, "concept_graph_config_path"):
-            pass
-        else:
-            from easydict import EasyDict
-            cfg = EasyDict(cfg)
-
-        graph_cfg_path = getattr(cfg, "concept_graph_config_path", None)
-        if graph_cfg_path and os.path.exists(graph_cfg_path):
-            graph_cfg = OmegaConf.load(graph_cfg_path)
-            OmegaConf.resolve(graph_cfg)
-        else:
-            graph_cfg = getattr(cfg, "scene_graph", {})
-
-        scene = Scene(
-            scene_id=scene_id, cfg=cfg, graph_cfg=graph_cfg,
-            detection_model=detection_model, sam_predictor=sam_predictor,
-            clip_model=clip_model, clip_preprocess=clip_preprocess,
-            clip_tokenizer=clip_tokenizer,
-        )
-
-        if start_pts is not None and not np.isnan(start_pts).any():
-            pts = start_pts.copy()
-            angle = start_angle
-        else:
-            start_pts_random = scene.pathfinder.get_random_navigable_point()
-            if np.isnan(start_pts_random).any():
-                start_pts_random = np.array([0.0, 1.5, 0.0])
-            pts = start_pts_random.copy()
-            angle = 0.0
-
-        from src.geom import get_scene_bnds
-        vol_bnds, _ = get_scene_bnds(scene.pathfinder, floor_height=pts[1])
-        tsdf_planner = TSDFPlanner(
-            vol_bnds=vol_bnds,
-            voxel_size=cfg.tsdf_grid_size,
-            floor_height=pts[1],
-            floor_height_offset=0,
-            pts_init=pts,
-            init_clearance=cfg.init_clearance * 2,
-            save_visualization=False,
-        )
-
-        memory_store = MemoryStore(
-            output_dir=os.path.join(output_dir, f"memory_{question_id}")
-        )
-
-        executor = Executor(
-            scene, tsdf_planner, memory_store, cfg,
-            detection_model, sam_predictor,
-            clip_model, clip_preprocess, clip_tokenizer,
-        )
-        executor.set_state(pts, angle, 0)
-
-    except Exception as e:
-        logger.error(f"Two-tier initialization failed: {e}")
-        result["error"] = str(e)
-        return result
-
-    try:
-        # ── Step 1: Initial panorama ─────────────────────────────────
-        logger.info("--- Two-Tier Step 1: Initial Panorama ---")
-        evidence = executor.explore_panorama()
-        notebook.update_from_evidence(evidence, step=silent_perception_step._step_counter)
-
-        # ── Helper builders ──────────────────────────────────────────
-
-        def _build_scene_analysis() -> str:
-            lines = []
-            if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
-                lines.append("## Scene Analysis")
-                for room in tsdf_planner.room_regions:
-                    lines.append(
-                        f"- Room {room.room_id}: area={room.area:.0f}, "
-                        f"observed={room.observed_ratio:.0%}, "
-                        f"frontiers={getattr(room, 'frontier_ids', [])}"
-                    )
-            else:
-                lines.append("## Scene Analysis\nNo room segmentation available.")
-            return "\n".join(lines)
-
-        def _build_progress(round_num: int) -> str:
-            lines = [
-                "## Progress",
-                f"Target: {question}",
-                f"Round {round_num + 1} / {max_planner_rounds}",
-            ]
-            visited = notebook.get_visited_seeds() | notebook.get_visited_frontiers()
-            if visited:
-                lines.append(f"Already visited: {', '.join(sorted(visited))}")
-            return "\n".join(lines)
-
-        def _build_actions() -> str:
-            lines = ["## Actions"]
-            lines.append("1. explore_panorama")
-            lines.append("2. navigate_to_object <object_name>")
-            lines.append("3. explore_seed <seed_id>")
-            lines.append("4. explore_frontier <frontier_id>")
-            lines.append("5. inspect_object <object_name>")
-            lines.append("6. submit_answer <answer>")
-            visited_seeds = notebook.get_visited_seeds()
-            visited_frontiers = notebook.get_visited_frontiers()
-            if visited_seeds or visited_frontiers:
-                lines.append("")
-                if visited_seeds:
-                    lines.append(f"Exhausted seeds: {', '.join(sorted(visited_seeds))}")
-                if visited_frontiers:
-                    lines.append(f"Exhausted frontiers: {', '.join(sorted(visited_frontiers))}")
-            return "\n".join(lines)
-
-        # ── Planner-Executor loop ────────────────────────────────────
-        for round_num in range(max_planner_rounds):
-            rounds_used = round_num + 1
-
-            # Build 4-component prompt
-            history = notebook.get_injection_text()
-            scene_analysis = _build_scene_analysis()
-            progress = _build_progress(round_num)
-            actions = _build_actions()
-
-            # Last evidence key frame as image (if any)
-            image_b64 = (
-                evidence.key_frames[-1]
-                if evidence and evidence.key_frames
-                else None
-            )
-
-            # Planner decides
-            action = planner.decide(
-                question=question,
-                history=history,
-                scene=scene_analysis,
-                progress=progress,
-                actions=actions,
-                image_b64=image_b64,
-            )
-            logger.info(
-                "Round %d: action=%s confidence=%.2f reason=%s",
-                rounds_used, action.action_type, action.confidence, action.reason,
-            )
-
-            # Check submit_answer
-            if action.action_type == "submit_answer":
-                result["answer"] = action.answer or ""
-                result["success"] = True
-                result["steps_taken"] = silent_perception_step._step_counter
-                result["rounds_used"] = rounds_used
-                logger.info(f"Answer submitted at round {rounds_used}: {result['answer']}")
-                return result
-
-            # Executor executes
-            evidence = executor.execute_action(action)
-            current_step = silent_perception_step._step_counter
-            notebook.update_from_evidence(evidence, step=current_step)
-
-            # Loop detection: force switch if entity exhausted
-            exhausted_id = (
-                action.seed_id
-                or action.frontier_id
-                or ""
-            )
-            if exhausted_id and notebook.is_exhausted(exhausted_id):
-                logger.info(f"Entity {exhausted_id} exhausted — forcing strategy switch next round.")
-                continue
-
-            # Step budget check
-            if silent_perception_step._step_counter >= max_total_steps:
-                logger.info("Step budget exhausted.")
-                break
-
-        # ── Fallback: submit best guess ──────────────────────────────
-        logger.info("Budget exhausted — fallback: submit best guess.")
-        fallback_action = planner.decide(
-            question=question,
-            history=notebook.get_injection_text(),
-            scene="## Scene Analysis\n(No current observation — budget exhausted)",
-            progress="## Progress\nAll rounds used. Submit your best answer now.",
-            actions="## Actions\n6. submit_answer <your_best_guess>",
-            image_b64=None,
-        )
-        result["answer"] = fallback_action.answer or "unanswerable"
-        result["success"] = "unanswerable" not in result["answer"].lower()
-        result["steps_taken"] = silent_perception_step._step_counter
-        result["rounds_used"] = max_planner_rounds
-        return result
-
-    except Exception as e:
-        logger.error(f"Two-tier workflow error: {e}")
-        import traceback
-        traceback.print_exc()
-        result["error"] = str(e)
-        return result
-
-    finally:
-        if scene is not None:
+    if not hasattr(tsdf_planner, "room_regions") or not tsdf_planner.room_regions:
+        return
+    existing_ids = set(seed_view_manager.seeds.keys())
+    # Find which room the agent is currently in
+    agent_voxel = tsdf_planner.habitat2voxel(agent_pts)[:2]
+    agent_room_id = tsdf_planner.get_room_id_at(agent_voxel)
+    logger.info(f"_register_new_seeds: agent_room_id={agent_room_id}, "
+                f"existing_ids={existing_ids}, "
+                f"room_ids={[r.room_id for r in tsdf_planner.room_regions]}")
+    for room in tsdf_planner.room_regions:
+        # Skip the room the agent is already in
+        if room.room_id == agent_room_id:
+            continue
+        if room.room_id not in existing_ids:
             try:
-                scene.__del__()
-            except Exception:
-                pass
+                # room.center is 2D voxel [vy, vx], convert to 3D habitat
+                # Per debug_render_episode.py:878-885, use _vol_bnds + 0.5 offset
+                # (voxel center, not corner) and pin height to eye level 1.5m
+                vy, vx = int(room.center[0]), int(room.center[1])
+                voxel_size = tsdf_planner._voxel_size
+                world_y = tsdf_planner._vol_bnds[0, 0] + (vy + 0.5) * voxel_size
+                world_x = tsdf_planner._vol_bnds[1, 0] + (vx + 0.5) * voxel_size
+                seed_normal = np.asarray([world_y, world_x, 1.5], dtype=float)
+                center_habitat = pos_normal_to_habitat(seed_normal)
+                seed_view_manager.register_seed(
+                    room.room_id, center_habitat,
+                    scene, tsdf_planner, agent_pts)
+            except Exception as e:
+                logger.warning(f"_register_new_seeds: failed to register "
+                              f"seed {room.room_id}: {e}")
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -948,33 +842,44 @@ def _format_frontiers_info(tsdf_planner) -> str:
 
 
 def _parse_vlm_response(response: str) -> dict:
-    """Parse VLM JSON response."""
-    if response is None:
-        response = ""
-    try:
-        # Try to find JSON block
-        if "```" in response:
-            # Extract content between first ``` and last ```
-            parts = response.split("```")
-            for part in parts:
-                part = part.strip()
-                if part.startswith("json"):
-                    part = part[4:]
-                try:
-                    return json.loads(part.strip())
-                except json.JSONDecodeError:
-                    continue
+    """Parse VLM JSON response. Enforce mandatory 'reason' field.
 
-        # Try direct JSON parse
-        return json.loads(response.strip())
-    except (json.JSONDecodeError, Exception) as e:
-        logger.warning(f"Failed to parse VLM response as JSON: {e}")
-        return {
-            "reasoning": response[:200],
-            "tool": "unknown",
-            "arguments": "",
-            "answer": "",
-        }
+    Returns dict with at least:
+        - tool: str (action name, or 'parse_error'/'missing_reason')
+        - reason: str (may be empty if missing)
+        - raw: str (original response, only on error)
+    """
+    import json as _json
+
+    # Try to extract JSON from response (VLM may add prose around it)
+    text = response.strip() if response else ""
+    # Find first { and last }
+    start = text.find('{')
+    end = text.rfind('}')
+    if start == -1 or end == -1 or end <= start:
+        return {"tool": "parse_error", "reason": "", "raw": response}
+
+    try:
+        parsed = _json.loads(text[start:end + 1])
+    except _json.JSONDecodeError:
+        return {"tool": "parse_error", "reason": "", "raw": response}
+
+    # Enforce reason field
+    reason = parsed.get("reason", "").strip()
+    if not reason:
+        return {"tool": "missing_reason", "reason": "", "raw": response}
+
+    parsed["reason"] = reason
+
+    # Determine tool from action or frontier_id presence
+    if "frontier_id" in parsed:
+        parsed["tool"] = "explore_frontier"
+    elif "object" in parsed and "action" not in parsed:
+        parsed["tool"] = "object_selected"
+    else:
+        parsed["tool"] = parsed.get("action", "")
+
+    return parsed
 
 
 # ── Direct Run (for testing) ────────────────────────────────────────────

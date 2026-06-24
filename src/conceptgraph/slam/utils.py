@@ -1261,6 +1261,7 @@ def batch_mask_depth_to_points_colors(
     cam_K: torch.Tensor,
     image_rgb_tensor: torch.Tensor = None,  # Parameter for RGB image tensor
     device: str = "cuda",
+    camera_convention: str = "opengl",
 ) -> tuple:
     """
     Converts a batch of masked depth images to 3D points and corresponding colors.
@@ -1271,6 +1272,10 @@ def batch_mask_depth_to_points_colors(
         cam_K (torch.Tensor): A tensor of shape (3, 3) representing the camera intrinsic matrix.
         image_rgb_tensor (torch.Tensor, optional): A tensor of shape (N, H, W, 3) representing the RGB images. Defaults to None.
         device (str, optional): The device to perform the computation on. Defaults to 'cuda'.
+        camera_convention (str, optional): Camera coordinate convention for the
+            unprojected points. "opengl" preserves the original ConceptGraph
+            convention (x_right, y_up, z_back=-depth). "z_forward" uses the
+            TSDF/pinhole convention (x_right, y_down, z_forward=depth).
 
     Returns:
         tuple: A tuple containing the 3D points tensor of shape (N, H, W, 3) and the colors tensor of shape (N, H, W, 3).
@@ -1278,31 +1283,28 @@ def batch_mask_depth_to_points_colors(
     N, H, W = masks_tensor.shape
     fx, fy, cx, cy = cam_K[0, 0], cam_K[1, 1], cam_K[0, 2], cam_K[1, 2]
 
-    # # Generate grid of pixel coordinates
-    # y, x = torch.meshgrid(torch.arange(0, H, device=device), torch.arange(0, W, device=device), indexing='ij')
-    # z = depth_tensor.repeat(N, 1, 1) * masks_tensor  # Apply masks to depth
-    #
-    # valid = (z > 0).float()  # Mask out zeros
-    #
-    # x = (x - cx) * z / fx
-    # y = (y - cy) * z / fy
-    #
-    # points = torch.stack((x, y, z), dim=-1) * valid.unsqueeze(-1)  # Shape: (N, H, W, 3)
-
-    _x, _z = torch.meshgrid(
+    _x, _y = torch.meshgrid(
         torch.arange(0, W, device=device),
-        torch.arange(H - 1, -1, -1, device=device),
+        torch.arange(0, H, device=device),
         indexing="xy",
     )
-    y = depth_tensor.repeat(N, 1, 1) * masks_tensor  # Apply masks to depth
+    depth = depth_tensor.repeat(N, 1, 1) * masks_tensor  # Apply masks to depth
 
-    valid = (y > 0).float()  # Mask out zeros
+    valid = (depth > 0).float()  # Mask out zeros
 
-    x = (_x - cx) * y / fx
-    z = (_z - cy) * y / fy
-    points = torch.stack((x, z, -y), dim=-1) * valid.unsqueeze(
-        -1
-    )  # Shape: (N, H, W, 3)
+    x = (_x - cx) * depth / fx
+    if camera_convention == "opengl":
+        y_up = ((H - 1 - _y) - cy) * depth / fy
+        points = torch.stack((x, y_up, -depth), dim=-1)
+    elif camera_convention == "z_forward":
+        y_down = (_y - cy) * depth / fy
+        points = torch.stack((x, y_down, depth), dim=-1)
+    else:
+        raise ValueError(
+            "camera_convention must be either 'opengl' or 'z_forward', "
+            f"got {camera_convention!r}"
+        )
+    points = points * valid.unsqueeze(-1)  # Shape: (N, H, W, 3)
 
     if image_rgb_tensor is not None:
         # Repeat RGB image for each mask and apply masks
@@ -1340,6 +1342,7 @@ def detections_to_obj_pcd_and_bbox(
     dbscan_eps=None,
     dbscan_min_points=None,
     run_dbscan=None,
+    camera_convention="opengl",
     device="cuda",
 ):
     """
@@ -1354,6 +1357,7 @@ def detections_to_obj_pcd_and_bbox(
         min_points_threshold (int, optional): Minimum number of points required for an object. Defaults to 5.
         spatial_sim_type (str, optional): Type of spatial similarity. Defaults to 'axis_aligned'.
         device (str, optional): Device to use. Defaults to 'cuda'.
+        camera_convention (str, optional): 'opengl' (z-back, z<0 valid) or 'z_forward' (z>0 valid). Defaults to 'opengl'.
 
     Returns:
         list: List of dictionaries containing processed objects. Each dictionary contains a point cloud and a bounding box.
@@ -1375,7 +1379,8 @@ def detections_to_obj_pcd_and_bbox(
         image_rgb_tensor = None
 
     points_tensor, colors_tensor = batch_mask_depth_to_points_colors(
-        depth_tensor, masks_tensor, cam_K_tensor, image_rgb_tensor, device
+        depth_tensor, masks_tensor, cam_K_tensor, image_rgb_tensor, device,
+        camera_convention=camera_convention,
     )  # points_tensor: [N, H, W, 3], colors_tensor: [N, H, W, 3]
 
     processed_objects = [None] * N  # Initialize with placeholders
@@ -1383,7 +1388,10 @@ def detections_to_obj_pcd_and_bbox(
         mask_points = points_tensor[i]
         mask_colors = colors_tensor[i] if colors_tensor is not None else None
 
-        valid_points_mask = mask_points[:, :, 2] < 0
+        if camera_convention == "z_forward":
+            valid_points_mask = mask_points[:, :, 2] > 0
+        else:  # opengl (default)
+            valid_points_mask = mask_points[:, :, 2] < 0
         if torch.sum(valid_points_mask) < min_points_threshold:
             continue
 

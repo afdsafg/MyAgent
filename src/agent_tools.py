@@ -9,22 +9,6 @@ from typing import List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── 全景配置 ──────────────────────────────────────────────────────────────
-
-VIEW_LABELS = [
-    "Front", "Front-Right", "Right", "Back-Right",
-    "Back", "Back-Left", "Left", "Front-Left",
-]
-
-
-def observe_panorama_config() -> dict:
-    """Return configuration dict for panorama observation."""
-    return {
-        "view_count": 8,
-        "resolution": 400,
-        "view_labels": list(VIEW_LABELS),
-    }
-
 
 # ── 每 step 静默感知 ────────────────────────────────────────────────────
 
@@ -117,12 +101,14 @@ def _navigate_to_target_with_agent_step(
     memory_store, cam_intr, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
+    seed_view_manager=None, active_seed_ids=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, int]:
     """循环调用 set_next_navigation_point + agent_step 直到抵达目标。
 
     决策节奏：VLM 调用此函数后不参与每子步决策，只在抵达后由调用方唤醒 VLM。
     每个子步后执行 silent_perception_step（plan §3：每 step 存档）。
     step_budget: 剩余底层步数配额，超出后停止导航。
+    seed_view_manager: optional SeedViewManager for lazy seed view updates.
     Returns: (final_pts, final_angle, arrived, status, substeps_taken)
     """
     # 确保上一次的导航状态被清空，避免 set_next 拒绝
@@ -164,6 +150,11 @@ def _navigate_to_target_with_agent_step(
             clip_model, clip_preprocess, clip_tokenizer,
         )
 
+        # Update seed views if conditions met (lazy update)
+        if seed_view_manager is not None and active_seed_ids:
+            seed_view_manager.update_after_step(
+                active_seed_ids, cur_pts, tsdf_planner, scene)
+
         if target_arrived:
             arrived = True
             break
@@ -182,27 +173,34 @@ def observe_panorama(
     scene, tsdf_planner, pts, angle, cnt_step,
     memory_store, cam_intr, cfg, detection_model,
     sam_predictor, clip_model, clip_preprocess, clip_tokenizer,
-) -> Tuple[np.ndarray, np.ndarray, str, str]:
-    """8 视角全景观测，返回 (pts, angle, mosaic_b64, text)。
+) -> Tuple[np.ndarray, np.ndarray, str, str, list]:
+    """8 视角全景观测，返回 (pts, angle, mosaic_b64, text, panorama_views)。
 
-    8 个视角均匀覆盖 360°（endpoint=False 避免首尾重叠）。
+    8 视角：前/右前/右/右后/后/左后/左/左前（相对 agent 朝向，顺时针每 45°）
+    拼图布局：3×3 网格，中心是方位指南针
     """
     from src.agent_image_utils import make_mosaic, numpy_to_base64
+    import matplotlib.pyplot as plt
 
-    config = observe_panorama_config()
-    n_views = config["view_count"]
-    target_h = config["resolution"]
-    view_labels = config["view_labels"]
+    DIRECTIONS = ["front", "front-right", "right", "back-right", "back", "back-left", "left", "front-left"]
+    # Clockwise every 45°, view_idx 0 = agent's current heading = "front"
+    angles = [angle + i * 2 * np.pi / 8 for i in range(8)]
 
-    angles = np.linspace(-np.pi, np.pi, n_views, endpoint=False)
-    views = []
-    cam_poses = []
-    for ang in angles:
+    panorama_views = []
+    views_rgb = []
+    for i, ang in enumerate(angles):
         obs, cam_pose = scene.get_observation(pts, ang)
-        cam_poses.append(cam_pose)
-        views.append(obs["color_sensor"][..., :3])
+        rgb = obs["color_sensor"][..., :3]
+        views_rgb.append(rgb)
+        panorama_views.append({
+            "view_idx": i,
+            "direction": DIRECTIONS[i],
+            "angle": float(ang),
+            "cam_pose": cam_pose,
+            "rgb": rgb,
+        })
 
-    # 静默执行感知（3视角 + TSDF + 场景图更新；snapshot 由下方 7 视角存档）
+    # 静默执行感知（3视角 + TSDF + 场景图更新；snapshot 由下方 8 视角存档）
     silent_perception_step(
         scene, tsdf_planner, pts, angle, cnt_step, memory_store,
         cam_intr, cfg, detection_model, sam_predictor,
@@ -210,11 +208,76 @@ def observe_panorama(
         skip_snapshots=True,
     )
 
-    # 保存全景视角到 MemoryStore
+    # 关键：silent_perception_step 只融合 3 个前视角到 TSDF，
+    # 但全景有 8 个视角。需要把另外 5 个视角也融合到 TSDF，
+    # 否则 room segmentation 只有 3 个视角的覆盖（3317 voxels），
+    # 找不到 4 个房间（需要 8 视角的 5069 voxels 覆盖）。
+    from src.habitat import pose_habitat_to_tsdf as _pose_to_tsdf
+    for v in panorama_views:
+        # 跳过 silent_perception_step 已融合的 3 个视角
+        if v["direction"] in ["front", "left", "right"]:
+            continue
+        try:
+            obs_v, cam_pose_v = scene.get_observation(pts, v["angle"])
+            tsdf_planner.integrate(
+                color_im=obs_v["color_sensor"],
+                depth_im=obs_v["depth_sensor"],
+                cam_intr=cam_intr,
+                cam_pose=_pose_to_tsdf(cam_pose_v),
+                obs_weight=1.0,
+                margin_h=int(cfg.margin_h_ratio * cfg.img_height),
+                margin_w=int(cfg.margin_w_ratio * cfg.img_width),
+                explored_depth=cfg.explored_depth,
+            )
+        except Exception as e:
+            logging.warning(f"observe_panorama: extra TSDF integrate failed for {v['direction']}: {e}")
+
+    # 触发房间分割 + frontier 更新（关键：8 视角全景后必须调用，
+    # 否则 room_regions 为空，SeedViewManager 注册不到任何 seed）
+    # 先刷新 grid（update_frontier_map 内部会做，但如果 frontier 为空
+    # 它会提前 return False，跳过 update_room_map，所以这里先手动刷新）
+    try:
+        from src.habitat import pos_habitat_to_normal
+        import scipy.ndimage as _ndimage
+        pts_normal = pos_habitat_to_normal(pts)
+        island, unoccupied = tsdf_planner.get_island_around_pts(
+            pts_normal, height=tsdf_planner.occupancy_height)
+        tsdf_planner.unoccupied = unoccupied
+        tsdf_planner.island = island
+        tsdf_planner.unexplored = (np.sum(tsdf_planner._explore_vol_cpu, axis=-1) == 0).astype(int)
+        for point in tsdf_planner.init_points:
+            tsdf_planner.unexplored[point[0], point[1]] = 0
+        tsdf_planner.occupied = np.logical_not(tsdf_planner.unoccupied).astype(int)
+        kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]])
+        tsdf_planner.unexplored_neighbors = _ndimage.convolve(
+            tsdf_planner.unexplored, kernel, mode="constant", cval=0.0)
+        tsdf_planner.occupied_map_camera = np.logical_not(
+            tsdf_planner.get_island_around_pts(pts_normal, height=tsdf_planner.vision_height)[0])
+    except Exception as e:
+        logging.warning(f"observe_panorama: grid refresh failed: {e}")
+
+    # 直接调用 update_room_map（不依赖 update_frontier_map，因为后者
+    # 初始房间分割：用 observed_ratio_threshold=0.0 接受所有房间
+    # （全景时大部分房间未充分探索，配置的 0.30 会过滤掉它们）。
+    # 使用 MSGNav-main (2) 的标准 update_room_map 路径，不做自构 envelope。
+    try:
+        from omegaconf import OmegaConf as _OC
+        room_cfg = tsdf_planner._cfg_get(cfg.planner, "room_segmentation", None)
+        if room_cfg is not None:
+            room_cfg_init = _OC.create(_OC.to_container(room_cfg))
+            room_cfg_init.observed_ratio_threshold = 0.0
+            room_cfg_init.max_unobserved_room_hops = 99
+            tsdf_planner.update_room_map(cfg=room_cfg_init, pts=pts_normal)
+            logging.info(f"observe_panorama: room_seg found "
+                        f"{len(tsdf_planner.room_regions)} rooms")
+    except Exception as e:
+        logging.warning(f"observe_panorama: room_seg failed: {e}")
+
+    # 保存全景 8 张视角到 MemoryStore
     room_id = tsdf_planner.get_room_id_at(
         tsdf_planner.habitat2voxel(pts)[:2])
     step_id = silent_perception_step._step_counter
-    for ang_idx, (view_rgb, label) in enumerate(zip(views, view_labels)):
+    for ang_idx, view_rgb in enumerate(views_rgb):
         objs_in_view = [
             scene.objects[oid]["class_name"]
             for oid in scene.objects
@@ -223,7 +286,7 @@ def observe_panorama(
             ) < cfg.scene_graph.obj_include_dist + 0.5
         ]
         memory_store.add_snapshot(
-            snapshot_id=f"step{step_id}_pano_{label}",
+            snapshot_id=f"pano_step{step_id}_view{ang_idx}",
             image=view_rgb,
             room_id=room_id,
             objects_in_view=objs_in_view,
@@ -233,22 +296,48 @@ def observe_panorama(
             clip_tokenizer=clip_tokenizer,
         )
 
-    # 更新 frontier / 房间分割
-    tsdf_planner.update_frontier_map(
-        pts, cfg.planner, scene, cnt_step, save_frontier_image=False)
+    # 构建 3×3 拼图（中心是方位指南针）
+    fig, axes = plt.subplots(3, 3, figsize=(12, 12))
+    ax_ord = np.array([[7, 0, 1], [6, -1, 2], [5, 4, 3]])
+    for row in range(3):
+        for col in range(3):
+            idx = ax_ord[row, col]
+            ax = axes[row, col]
+            if idx == -1:
+                # 中心格：方位指南针
+                ax.axis('off')
+                ax.set_xlim(0, 1)
+                ax.set_ylim(0, 1)
+                cx, cy = 0.5, 0.5
+                al = 0.25
+                ax.annotate('', xy=(cx, cy+al), xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+                ax.annotate('', xy=(cx, cy-al), xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+                ax.annotate('', xy=(cx-al, cy), xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+                ax.annotate('', xy=(cx+al, cy), xytext=(cx, cy),
+                    arrowprops=dict(arrowstyle='->', lw=2, color='black'))
+                ax.text(cx, cy+al+0.05, 'Front', ha='center', fontsize=12, fontweight='bold')
+                ax.text(cx, cy-al-0.05, 'Back', ha='center', fontsize=12, fontweight='bold')
+                ax.text(cx-al-0.05, cy, 'Left', va='center', fontsize=12, fontweight='bold')
+                ax.text(cx+al+0.05, cy, 'Right', va='center', fontsize=12, fontweight='bold')
+            else:
+                ax.imshow(views_rgb[idx])
+                ax.set_title(DIRECTIONS[idx], fontsize=11, fontweight='bold')
+                ax.axis('off')
 
-    mosaic = make_mosaic(views, target_h=400)
+    fig.tight_layout()
+    # Rasterize to numpy (use renderer.buffer_rgba for backend compatibility)
+    fig.canvas.draw()
+    renderer = fig.canvas.get_renderer()
+    raw = renderer.buffer_rgba()
+    mosaic = np.asarray(raw)[:, :, :3]  # drop alpha
+    plt.close(fig)
+
     mosaic_b64 = numpy_to_base64(mosaic)
-
-    room_info = ""
-    if hasattr(tsdf_planner, "room_regions") and tsdf_planner.room_regions:
-        room_info = f"\nRooms detected: {len(tsdf_planner.room_regions)}"
-
-    text = (
-        f"Panorama observed. {len(tsdf_planner.frontiers)} frontiers available."
-        f"{room_info}"
-    )
-    return pts, angle, mosaic_b64, text
+    text = f"Panorama: 8 views (front/front-right/right/back-right/back/back-left/left/front-left) at step {cnt_step}"
+    return pts, angle, mosaic_b64, text, panorama_views
 
 
 def view_direction(
@@ -287,52 +376,43 @@ def view_direction(
 
 
 def navigate_to_object(
-    scene, tsdf_planner, pts, angle, object_desc,
+    scene, tsdf_planner, pts, angle,
+    view_idx, view_angle, view_cam_pose, object_desc,
     memory_store, cam_intr, cfg, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_steps=20, step_budget=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """GD 导航到指定物体。返回 (pts, angle, success, status, img_b64)。
 
-    GD 导航内部：检测→迭代螺旋搜索导航。VLM 不参与每子步决策，只在完成后被唤醒。
+    视角由 VLM 选定（view_idx + view_angle + view_cam_pose）。
+    GD 检测使用该视角，不做方向扫描。
     step_budget 用于限制导航步数，避免超出总步数配额。
     """
     from src.scene_aeqa import grounded_navigate_to_object as gd_nav
     from src.agent_image_utils import numpy_to_base64
 
-    # 用剩余配额限制导航步数
     max_nav = 15
     max_iter = 5
     if step_budget is not None:
         max_nav = min(max_nav, max(1, step_budget))
         max_iter = min(max_iter, max(1, step_budget // 3))
 
-    new_pts, new_angle, success, status, _images, target_normal = gd_nav(
-        scene, tsdf_planner, pts, angle, object_desc,
+    new_pts, new_angle, success, status, _images = gd_nav(
+        scene, tsdf_planner, pts, angle,
+        view_idx=view_idx, view_angle=view_angle, view_cam_pose=view_cam_pose,
+        object_desc=object_desc,
         max_consecutive_failures=5,
-        max_iterations=max_iter, converge_dist_voxels=12,
+        max_iterations=max_iter, converge_dist_voxels=5,
         max_nav_steps_per_iter=max_nav,
+        memory_store=memory_store, cam_intr_ext=cam_intr, cfg_ext=cfg,
+        detection_model=detection_model, sam_predictor=sam_predictor,
+        clip_model=clip_model, clip_preprocess=clip_preprocess,
+        clip_tokenizer=clip_tokenizer,
+        cnt_step_base=cnt_step, step_budget=step_budget,
     )
 
-    # Arrival verification: if GD claims success, confirm agent is within 1.5m of target
-    if success and target_normal is not None:
-        from src.habitat import pos_normal_to_habitat
-        target_habitat = pos_normal_to_habitat(target_normal)
-        dist = np.linalg.norm(new_pts[:3] - target_habitat[:3])
-        if dist > 1.5:
-            success = False
-            status = f"Failed to reach target: {object_desc} (dist={dist:.1f}m)"
-
-    # GD 导航完成后做一次静默感知并存档（plan：到达子目标后 3 视角观测）
-    silent_perception_step(
-        scene, tsdf_planner, new_pts, new_angle, cnt_step, memory_store,
-        cam_intr, cfg, detection_model, sam_predictor,
-        clip_model, clip_preprocess, clip_tokenizer,
-    )
-    tsdf_planner.update_frontier_map(
-        new_pts, cfg.planner, scene, cnt_step, save_frontier_image=False)
-
-    # 返回当前视角图像给 VLM
+    # GD 导航内部每子步已做 silent_perception + refresh + update_frontier
+    # 这里只返回当前视角图像给 VLM
     obs, _ = scene.get_observation(new_pts, new_angle)
     img_b64 = numpy_to_base64(obs["color_sensor"][..., :3])
 
@@ -344,6 +424,7 @@ def navigate_to_seed(
     memory_store, cam_intr, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
+    seed_view_manager=None, active_seed_ids=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """导航到指定房间种子点。返回 (pts, angle, success, status, img_b64)。
 
@@ -381,7 +462,10 @@ def navigate_to_seed(
         scene, tsdf_planner, cur_pts, cur_angle, temp_frontier, cfg,
         memory_store, cam_intr, detection_model, sam_predictor,
         clip_model, clip_preprocess, clip_tokenizer, cnt_step, max_substeps,
-        step_budget=step_budget)
+        step_budget=step_budget,
+        seed_view_manager=seed_view_manager,
+        active_seed_ids=active_seed_ids or [],
+    )
 
     # 抵达后更新 frontier / 房间分割
     if np.linalg.norm(final_pts - cur_pts) > 1e-3:
@@ -400,6 +484,7 @@ def navigate_to_frontier(
     memory_store, cam_intr, detection_model, sam_predictor,
     clip_model, clip_preprocess, clip_tokenizer, cnt_step,
     max_substeps=25, step_budget=None,
+    seed_view_manager=None, active_seed_ids=None,
 ) -> Tuple[np.ndarray, np.ndarray, bool, str, Optional[str]]:
     """导航到指定 frontier。返回 (pts, angle, success, status, img_b64)。
 
@@ -421,7 +506,10 @@ def navigate_to_frontier(
         scene, tsdf_planner, cur_pts, cur_angle, frontier, cfg,
         memory_store, cam_intr, detection_model, sam_predictor,
         clip_model, clip_preprocess, clip_tokenizer, cnt_step, max_substeps,
-        step_budget=step_budget)
+        step_budget=step_budget,
+        seed_view_manager=seed_view_manager,
+        active_seed_ids=active_seed_ids or [],
+    )
 
     if np.linalg.norm(final_pts - cur_pts) > 1e-3:
         tsdf_planner.update_frontier_map(
