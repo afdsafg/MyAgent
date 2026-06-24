@@ -79,7 +79,7 @@ planner:
     max_dilation_iter: 80
     stable_iou_threshold: 0.2
     close_iterations: 1
-    room_height: 2.0  # use 2.0m for room segmentation envelope
+    room_height: 1.5  # 1.5m clean room boundaries (above furniture, below ceiling)
 
 # about scene graph construction
 scene_graph:

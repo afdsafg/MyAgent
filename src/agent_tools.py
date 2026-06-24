@@ -285,14 +285,10 @@ def observe_panorama(
         stable_iou_threshold = float(tsdf_planner._cfg_get(room_cfg_init, "stable_iou_threshold", 0.2))
 
         tsdf = tsdf_planner._tsdf_vol_cpu
-
-        # Use ALL TSDF-observed area as envelope (not just navigable).
-        # Previous envelope = (tsdf[:,:,hv] > 0) & (tsdf[:,:,0] < 0)
-        # only included "standable + headroom" voxels, missing areas
-        # visible through doorways and over furniture.
-        # New: use every voxel column that has ANY TSDF observation,
-        # letting watershed find natural room boundaries at walls.
-        envelope = np.any(tsdf != 0, axis=2)
+        voxel_size = tsdf_planner._voxel_size
+        min_height_voxel = tsdf_planner.min_height_voxel
+        hv = int(1.5 / voxel_size) + min_height_voxel  # 1.5m for clean room boundaries
+        envelope = tsdf[:, :, hv] > 0
 
         if close_iterations > 0:
             kernel = _cv2.getStructuringElement(_cv2.MORPH_CROSS, (3, 3))
